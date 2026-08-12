@@ -1,0 +1,22 @@
+services:
+  docintel:
+    build: .
+    container_name: docintel
+    restart: unless-stopped
+
+    ports:
+      - "8097:8000"
+
+    volumes:
+      - ./uploads:/data/uploads
+      - ./output:/data/output
+      - ./data:/data/db
+
+    environment:
+      TZ: America/Sao_Paulo
+      DOCINTEL_UPLOADS: /data/uploads
+      DOCINTEL_OUTPUT: /data/output
+      DOCINTEL_DB: /data/db/docintel.db
+      # Quantidade de conversões processadas em paralelo. Cada uma usa 1 core
+      # inteiro em picos (OCR); comece baixo e suba conforme o servidor aguentar.
+      DOCINTEL_WORKERS: "2"
