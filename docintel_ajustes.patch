@@ -1,0 +1,690 @@
+diff --git a/app/converter.py b/app/converter.py
+index 9a98594..afba7d6 100755
+--- a/app/converter.py
++++ b/app/converter.py
+@@ -375,35 +375,202 @@ def _is_block_start_apostila(line: str) -> bool:
+     return any(p.match(line) for p in _BLOCK_START_PATTERNS_APOSTILA)
+ 
+ 
++def _e_subtopico_indentado(line: str) -> bool:
++    """Uma linha INDENTADA (recuada em relação à margem) começa um
++    sub-tópico novo -- não é só continuação do parágrafo/bullet anterior
++    -- quando, depois de tirado o recuo, ela mesma casa com um marcador
++    de bloco reconhecido (ver `_BLOCK_START_PATTERNS_APOSTILA`). Usado
++    por `reflow_paragraphs_apostila` pra não achatar hierarquia de
++    tópicos (pai -> filho) numa lista única -- ver docstring da seção
++    "Reflow com padrões extras de índice/sumário" acima e o registro do
++    bug de hierarquia achatada que motivou isso."""
++    sem_recuo = line.lstrip()
++    return any(p.match(sem_recuo) for p in _BLOCK_START_PATTERNS_APOSTILA)
++
++
+ def reflow_paragraphs_apostila(md_text: str) -> str:
+     """Ver docstring da seção "Reflow com padrões extras de índice/sumário"
+-    acima. Mesma lógica de `reflow_paragraphs`, só com a lista de padrões
+-    estendida."""
++    acima. Mesma lógica de `reflow_paragraphs`, com a lista de padrões
++    estendida E uma diferença adicional, exclusiva desta cópia: uma linha
++    indentada que ela mesma comece com um marcador de bloco reconhecido
++    (bullet, item de índice, etc. -- ver `_e_subtopico_indentado`) abre um
++    sub-tópico NOVO, aninhado um nível abaixo do bloco atual (prefixo
++    "  " na saída), em vez de ser colada como texto solto no bloco pai --
++    a apostila usa indentação pra marcar hierarquia visual entre tópicos
++    (ex: "Características fundamentais:" com "Hereditariedade:" e
++    "Vitaliciedade:" como sub-itens abaixo), e colar tudo numa frase só
++    misturava itens que no PDF são pontos distintos. Uma linha indentada
++    que NÃO comece com marcador nenhum (ex: um "-" de abertura de aspas
++    no meio de uma frase, ou a continuação sem marcador de um sub-item já
++    aberto) continua tratada como simples continuação, igual antes."""
+     blocos = []
+     atual = []
++    atual_aninhado = False
++
++    def _fechar_bloco():
++        texto = _juntar_linhas(atual)
++        blocos.append(("  " + texto) if atual_aninhado else texto)
++
+     for linha in md_text.split("\n"):
+         if not linha.strip():
+             continue
+-        if not atual or _is_block_start_apostila(linha):
+-            if atual:
+-                blocos.append(_juntar_linhas(atual))
+-            atual = [linha]
++        indentado = linha != linha.lstrip()
++        novo_subtopico = indentado and _e_subtopico_indentado(linha)
++        novo_bloco_normal = (not indentado) and _is_block_start_apostila(linha)
++
++        if not atual:
++            atual = [linha.lstrip() if novo_subtopico else linha]
++            atual_aninhado = novo_subtopico
++            continue
++
++        if novo_bloco_normal or novo_subtopico:
++            _fechar_bloco()
++            atual = [linha.lstrip() if novo_subtopico else linha]
++            atual_aninhado = novo_subtopico
+         else:
+             atual.append(linha)
++
+     if atual:
+-        blocos.append(_juntar_linhas(atual))
++        _fechar_bloco()
++
+     return "\n\n".join(blocos)
+ 
+ 
+-def process_pages_apostila(md_text: str) -> tuple:
++# --- Reposicionamento de imagens: mesma posição relativa do PDF original --
++#
++# No caminho legado do pymupdf4llm (`use_layout(False)` -- ver docstring
++# do módulo), quando a página inteira cai numa única coluna de texto (o
++# caso comum de apostila), a lib despeja TODAS as imagens da página no
++# FIM do bloco de texto daquela página -- na ordem vertical correta entre
++# si, mas sempre depois de todo o texto, mesmo quando a imagem aparece no
++# meio da página no PDF original (ex: entre dois parágrafos). Resultado:
++# a imagem sai associada ao texto ERRADO na nota (bug relatado: a imagem
++# da página 2 apareceu grudada no texto do fim da página, não onde ela
++# está de verdade no PDF).
++#
++# `_ancoras_de_imagem_por_pagina` acha, direto no PDF (não no Markdown já
++# processado), o texto que vem imediatamente ANTES de cada imagem na
++# ordem de leitura (topo -> baixo) de cada página. `_reposicionar_imagens_pagina`
++# usa esse texto como âncora pra mover cada imagem, já depois do reflow de
++# parágrafos, pro bloco certo -- logo depois do parágrafo/bullet que, no
++# PDF, vem antes dela. Quando não acha a âncora de uma imagem no texto da
++# página (heurística de correspondência textual -- pode falhar se o
++# reflow reformatou demais o texto ao redor), essa imagem simplesmente
++# fica onde já estava (comportamento anterior -- nunca perde a imagem, só
++# deixa de reposicionar aquela).
++_IMG_LINE_RE = re.compile(r"^!\[\]\(.+\.(?:png|jpe?g|webp)\)")
++
++
++def _ancoras_de_imagem_por_pagina(doc: "pymupdf.Document") -> dict:
++    """Ver docstring da seção acima. Devolve `{pagina_0indexada: [texto_ou_None, ...]}`
++    -- uma entrada por imagem da página, na mesma ordem (topo -> baixo)
++    em que o pymupdf4llm extrai as imagens dessa página."""
++    resultado = {}
++    for page in doc:
++        blocks = page.get_text("dict").get("blocks", [])
++        blocks = sorted(blocks, key=lambda b: (round(b["bbox"][1], 1), round(b["bbox"][0], 1)))
++        ancoras = []
++        texto_anterior = None
++        for b in blocks:
++            tipo = b.get("type")
++            if tipo == 0:  # bloco de texto
++                linhas = []
++                for line in b.get("lines", []):
++                    txt = "".join(span.get("text", "") for span in line.get("spans", []))
++                    if txt.strip():
++                        linhas.append(txt.strip())
++                if linhas:
++                    texto_anterior = linhas[-1]
++            elif tipo == 1:  # bloco de imagem
++                ancoras.append(texto_anterior)
++        if ancoras:
++            resultado[page.number] = ancoras
++    return resultado
++
++
++def _normalizar_para_match(texto: str) -> str:
++    """Normaliza texto pra comparação tolerante (ver
++    `_reposicionar_imagens_pagina`): minúsculo, sem marcação
++    markdown/aspas nem marcador de tópico decorativo (ver
++    `_MARCADOR_ESTRANHO_RE` -- o texto da âncora vem direto do PDF, com o
++    glifo original, enquanto o bloco já processado teve esse mesmo glifo
++    trocado por "-"; sem remover os dois lados, a âncora nunca bate),
++    espaços colapsados."""
++    texto = texto.lower()
++    texto = re.sub(r"[*_`~\"“”‘’<>–—\-❖➢⮚➤➥▶►∙•●○▪◦]", " ", texto)
++    texto = re.sub(r"\s+", " ", texto).strip()
++    return texto
++
++
++def _reposicionar_imagens_pagina(conteudo: str, ancoras: list) -> str:
++    """Ver docstring da seção acima. `conteudo` é o texto de UMA página já
++    reformatado (reflow já rodou -- blocos separados por linha em
++    branco); `ancoras` vem de `_ancoras_de_imagem_por_pagina`."""
++    if not ancoras:
++        return conteudo
++
++    blocos = conteudo.split("\n\n")
++    indices_imagem = [i for i, b in enumerate(blocos) if _IMG_LINE_RE.match(b.strip())]
++    if not indices_imagem:
++        return conteudo
++
++    imagens_bloco = [blocos[i] for i in indices_imagem]
++    indices_imagem_set = set(indices_imagem)
++    blocos_sem_imagem = [b for i, b in enumerate(blocos) if i not in indices_imagem_set]
++    normalizados = [_normalizar_para_match(b) for b in blocos_sem_imagem]
++
++    n = min(len(imagens_bloco), len(ancoras))
++    cursor = 0
++    por_posicao = {}  # posição (índice em blocos_sem_imagem) -> [imagens a inserir depois dela]
++    imagens_posicionadas = set()
++    for idx in range(n):
++        ancora = ancoras[idx]
++        if not ancora:
++            continue
++        alvo = _normalizar_para_match(ancora)
++        if not alvo:
++            continue
++        pos_encontrada = None
++        for j in range(cursor, len(normalizados)):
++            if alvo in normalizados[j]:
++                pos_encontrada = j
++                break
++        if pos_encontrada is None:
++            continue
++        por_posicao.setdefault(pos_encontrada, []).append(imagens_bloco[idx])
++        imagens_posicionadas.add(idx)
++        cursor = pos_encontrada
++
++    if not imagens_posicionadas:
++        return conteudo
++
++    # imagens sem âncora reconhecida (não bateu com nada, ou nem tinha
++    # âncora) continuam no fim da página, na ordem original entre si --
++    # mesmo comportamento de antes do reposicionamento.
++    imagens_restantes = [b for idx, b in enumerate(imagens_bloco) if idx not in imagens_posicionadas]
++
++    saida = []
++    for j, bloco in enumerate(blocos_sem_imagem):
++        saida.append(bloco)
++        if j in por_posicao:
++            saida.extend(por_posicao[j])
++    saida.extend(imagens_restantes)
++    return "\n\n".join(saida)
++
++
++def process_pages_apostila(md_text: str, ancoras_por_pagina: dict = None) -> tuple:
+     """Equivalente a `process_pages` (cópia isolada -- ver nota no topo da
+-    seção), mas com três diferenças, todas exclusivas da apostila:
++    seção), mas com quatro diferenças, todas exclusivas da apostila:
+     1. normaliza marcadores de tópico exóticos (`_normalizar_marcadores_apostila`);
+     2. extrai o corpo das notas de rodapé de dentro do fluxo de cada página
+        e as renumera sequencialmente pro documento inteiro (evita colisão
+        -- é comum a numeração de nota reiniciar a cada página no PDF);
+     3. usa `reflow_paragraphs_apostila` (padrões extras de índice) em vez
+-       do `reflow_paragraphs` original.
++       do `reflow_paragraphs` original;
++    4. reposiciona cada imagem da página pro ponto do corpo onde ela
++       aparece de verdade no PDF (ver `_reposicionar_imagens_pagina`) --
++       só quando `ancoras_por_pagina` é passado (vem de
++       `_ancoras_de_imagem_por_pagina`, calculado direto no PDF).
+     Devolve (texto, notas) -- notas é uma lista [(numero_global, corpo), ...]
+     na ordem em que apareceram, pra virar a lista de notas no fim do
+     arquivo (ver `convert_pdf`)."""
+@@ -411,11 +578,14 @@ def process_pages_apostila(md_text: str) -> tuple:
+     saida = []
+     notas_globais = []
+     contador_nota = {"n": 0}
++    ancoras_por_pagina = ancoras_por_pagina or {}
+ 
+-    def _processar_trecho(conteudo: str) -> str:
++    def _processar_trecho(conteudo: str, pagina_indice=None) -> str:
+         conteudo = _normalizar_marcadores_apostila(conteudo)
+         conteudo, notas_pagina = _extrair_notas_rodape_pagina(conteudo)
+         conteudo = reflow_paragraphs_apostila(conteudo)
++        if pagina_indice is not None and pagina_indice in ancoras_por_pagina:
++            conteudo = _reposicionar_imagens_pagina(conteudo, ancoras_por_pagina[pagina_indice])
+         for numero_original, corpo in notas_pagina:
+             contador_nota["n"] += 1
+             global_id = contador_nota["n"]
+@@ -436,7 +606,7 @@ def process_pages_apostila(md_text: str) -> tuple:
+         else:
+             pagina_num = str(pagina_indice + 1)
+ 
+-        conteudo = _processar_trecho(conteudo)
++        conteudo = _processar_trecho(conteudo, pagina_indice)
+ 
+         saida.append(conteudo)
+         saida.append(f"\n\n---\n*p. {pagina_num}*\n\n---\n\n")
+@@ -621,13 +791,62 @@ def _destacar_citacoes_de_lei(md_text: str) -> str:
+                 "\n".join(f"> {linha}" if linha.strip() else ">" for linha in b.split("\n"))
+                 for b in grupo
+             )
+-            saida.append(f"> [!quote] Texto de lei\n{corpo}")
++            # callout sem título próprio (nota o espaço depois de "]" --
++            # é o que o Obsidian espera pra reconhecer o marcador mesmo
++            # sem texto de título) -- "LEI" vira a primeira linha do
++            # CORPO do callout, não o título, seguida do(s) artigo(s)
++            # citado(s) na(s) linha(s) seguinte(s).
++            saida.append(f"> [!quote] \n> LEI\n{corpo}")
+             continue
+         saida.append(bloco)
+         i += 1
+     return "\n\n".join(saida)
+ 
+ 
++# --- Jurisprudência em bloco próprio (callout de alerta) --------------------
++#
++# A apostila também cita jurisprudência (acórdãos do STF/STJ, súmulas
++# vinculantes, notícias de julgamento) no meio do comentário da
++# professora -- igual acontece com citação de lei (ver seção acima), mas
++# com um callout diferente (`[!warning]`), pra distinguir visualmente um
++# do outro. Heurística baseada só no início do bloco: número de processo
++# de uma classe processual do STF/STJ (ADI, ADPF, RE, HC...) ou "Súmula
++# (Vinculante) N" -- como o resto do módulo, pode deixar passar formatos
++# atípicos (ex: uma citação de jurisprudência parafraseada sem o número
++# do processo no início do bloco).
++_JURISPRUDENCIA_RE = re.compile(
++    r"^[\-–—\*\s]*\**\s*(?:"
++    r"(?:ADI|ADPF|ADC|ADO|ARE|RE|AgRg|HC|MS|RHC|REsp|AREsp|RMS|RvC)\s*\.?\s*n?\.?\s*\d|"
++    r"S[uú]mula(?:\s+Vinculante)?\s*(?:n[ºo°]?\s*)?\d"
++    r")",
++    re.IGNORECASE,
++)
++
++
++def _destacar_jurisprudencia(md_text: str) -> str:
++    """Envolve blocos que abrem com citação de jurisprudência (ver
++    `_JURISPRUDENCIA_RE`) num callout `[!warning] Jurisprudência` --
++    título fixo no próprio marcador (diferente da citação de lei, que
++    não tem título -- ver `_destacar_citacoes_de_lei`), com o texto da
++    jurisprudência na(s) linha(s) seguinte(s) dentro do callout. Não
++    agrupa blocos seguintes como continuação (diferente da citação de
++    lei): cada bloco de jurisprudência normalmente já é autocontido, e
++    tentar juntar blocos seguintes arriscaria puxar comentário da
++    professora pra dentro do callout por engano."""
++    blocos = md_text.split("\n\n")
++    saida = []
++    for bloco in blocos:
++        primeira_linha = bloco.lstrip().split("\n", 1)[0]
++        if _JURISPRUDENCIA_RE.match(primeira_linha) and not bloco.lstrip().startswith(">"):
++            citado = "\n".join(
++                f"> {linha}" if linha.strip() else ">" for linha in bloco.split("\n")
++            )
++            saida.append(f"> [!warning] Jurisprudência\n{citado}")
++            continue
++        saida.append(bloco)
++    return "\n\n".join(saida)
++
++
+ # --- Callout de atenção para avisos didáticos -------------------------------
+ #
+ # A professora sinaliza avisos importantes com palavras-gatilho (Obs.,
+@@ -914,6 +1133,7 @@ def convert_pdf(input_path: str, job_dir: str, meta: dict) -> dict:
+     doc = pymupdf.open(input_path)
+     try:
+         ocr_por_pagina = _paginas_sem_texto_nativo(doc)
++        ancoras_por_pagina = _ancoras_de_imagem_por_pagina(doc)
+     finally:
+         doc.close()
+ 
+@@ -939,12 +1159,15 @@ def convert_pdf(input_path: str, job_dir: str, meta: dict) -> dict:
+ 
+     # process_pages_apostila remove o rodapé de cada página, normaliza
+     # marcadores de tópico exóticos, extrai o corpo das notas de rodapé
+-    # (renumerando pro documento inteiro) e faz o reflow de parágrafos com
+-    # os padrões extras de índice/sumário da apostila (ver docstrings da
+-    # seção "funções EXCLUSIVAS do pipeline de apostila" acima). É uma
+-    # cópia isolada de `process_pages` -- `converter_legislacao.py`
+-    # continua usando o `process_pages` original, sem essas adições.
+-    md_text, notas_rodape = process_pages_apostila(md_text)
++    # (renumerando pro documento inteiro), reposiciona cada imagem pro
++    # ponto do corpo onde ela aparece de verdade no PDF (ver
++    # `_ancoras_de_imagem_por_pagina` / `_reposicionar_imagens_pagina`) e
++    # faz o reflow de parágrafos com os padrões extras de índice/sumário
++    # da apostila (ver docstrings da seção "funções EXCLUSIVAS do
++    # pipeline de apostila" acima). É uma cópia isolada de `process_pages`
++    # -- `converter_legislacao.py` continua usando o `process_pages`
++    # original, sem essas adições (e não extrai imagem nenhuma).
++    md_text, notas_rodape = process_pages_apostila(md_text, ancoras_por_pagina)
+ 
+     # Índice/sumário do início do documento -> lista aninhada com
+     # wikilinks; citação de lei em bloco -> callout de citação; avisos
+@@ -953,6 +1176,7 @@ def convert_pdf(input_path: str, job_dir: str, meta: dict) -> dict:
+     # sobrevivido ao reflow.
+     md_text = _processar_indice(md_text)
+     md_text = _destacar_citacoes_de_lei(md_text)
++    md_text = _destacar_jurisprudencia(md_text)
+     md_text = _aplicar_callouts_alerta(md_text)
+     md_text = _remover_sites_residuais(md_text)
+ 
+diff --git a/app/converter_legislacao.py b/app/converter_legislacao.py
+index 44ebe45..babc629 100644
+--- a/app/converter_legislacao.py
++++ b/app/converter_legislacao.py
+@@ -89,8 +89,10 @@ _PARAGRAFO_UNICO_RE = re.compile(r"_?Par[aá]grafo\s+[uú]nico_?\s*\.\s*")
+ 
+ _PONTUACAO_FECHA = (".", ";", ":")
+ 
+-# Marcador de quebra de página inserido por `converter.process_pages`.
+-_PAGE_BREAK_RE = re.compile(r"\n\n---\n\*p\. \d+\*\n\n---\n\n")
++# Marcador de quebra de página inserido por `converter.process_pages` --
++# com grupo de captura no número, usado por `_limpar_e_rotular_paginas`
++# pra saber a página de cada trecho.
++_PAGE_BREAK_RE = re.compile(r"\n\n---\n\*p\. (\d+)\*\n\n---\n\n")
+ 
+ # Cabeçalho corrente que livros como o Vade Mecum repetem no topo de cada
+ # página (número da página + nome da lei/código em vigor naquele trecho,
+@@ -101,21 +103,134 @@ _RUNNING_HEADER_RE = re.compile(
+     r"^(\d{1,4}\s+)?([A-ZÀ-Ú][A-Za-zÀ-ÿ ]{1,60})(\s+\d{1,4})?(?=\s|$)"
+ )
+ 
++# Rodapé típico de um livro de legislação compilada (ex: Vade Mecum): só o
++# número da página, sozinho numa linha, sem nenhum domínio/URL na linha
++# seguinte -- diferente do rodapé de apostila (`_FOOTER_RE`, em
++# converter.py), que exige uma URL logo depois e por isso NUNCA reconhece
++# esse formato. Sem remover isso ANTES do reflow de parágrafos (que junta
++# linhas soltas do mesmo parágrafo), esse número sobra solto no meio do
++# texto de uma página e o reflow cola ele no meio da palavra/frase
++# seguinte -- ex: "República Fe8derativa" em vez de "República
++# Federativa" (bug real, reproduzido contra o Vade Mecum do Senado
++# Federal: o pymupdf4llm às vezes intercala o rodapé de uma página bem no
++# meio de uma palavra hifenizada na quebra de linha).
++_RODAPE_NUMERO_RE = re.compile(r"\n{2,}(\d{1,4})\n{2,}")
++
++# Cabeçalho de abertura de cada lei, no formato usado por livros de
++# legislação compilada tipo Vade Mecum: um heading com o nome da lei,
++# seguido (uma linha em branco depois) por um heading com a citação legal
++# ("Lei n° ...", "Decreto-lei n° ...", "Emenda Constitucional n° ...",
++# "Lei Complementar n° ..."). Normalmente aparece só uma vez, na abertura
++# de cada lei do compilado -- mas às vezes (mesma classe de bug do rodapé
++# solto -- extração da própria pymupdf4llm) esse par de headings vaza de
++# novo, no meio do corpo de um artigo, como se fosse cabeçalho de página
++# repetido. Usado tanto pra detectar troca de legislação (documento com
++# mais de uma lei) quanto pra limpar essa repetição espúria.
++_LEI_TITULO_RE = re.compile(
++    r"#{2,6}\s+\*{0,2}([A-ZÀ-Ú][^\n*]{2,80}?)\*{0,2}\s*\n\s*\n"
++    r"#{2,6}\s+\*{0,2}(?:Lei\s+Complementar|Lei|Decreto-lei|Emenda\s+Constitucional)\b[^\n]{0,80}\n?"
++)
++
+ 
+-def _limpar_ruido_paginas(texto: str) -> str:
++def _remover_rodape_numeros_pagina(md_text: str) -> str:
++    """Ver docstring de `_RODAPE_NUMERO_RE`. Roda ANTES de
++    `_base.process_pages` fazer o reflow de parágrafos, que é o passo que
++    efetivamente cola o número solto no meio da palavra seguinte. Remove
++    qualquer número isolado (linha em branco dos dois lados) no texto --
++    não tenta validar contra o número de página "esperado" (índice do
++    PDF + 1): um livro de legislação compilada como o Vade Mecum tem
++    várias páginas de capa/sumário antes do início da numeração impressa,
++    então o índice do PDF quase nunca bate com o número impresso no
++    rodapé. Aplica direto sobre o texto inteiro (sem separar por página)
++    -- o padrão (dígito sozinho, cercado de linha em branco dos dois
++    lados) nunca casa com o marcador `--- end of page=N ---` em si (o "N"
++    ali vem colado a "page=" e " ---", nunca cercado de linha em branco),
++    então não há risco de interferir na quebra de página que
++    `_base.process_pages` faz depois.
++
++    Troca por DUAS quebras de linha (não por um espaço) -- na maioria das
++    vezes o número de rodapé aparece bem no fim do conteúdo da página,
++    logo antes do marcador `--- end of page=N ---` que o pymupdf4llm
++    insere; comendo as quebras de linha ali (trocando por um espaço) tira
++    do marcador seguinte a quebra de linha que `_base.process_pages`
++    precisa pra reconhecê-lo (regride pra um bug pior: o marcador inteiro
++    vaza como texto). Trocar por "\\n\\n" evita isso e, pro reflow de
++    parágrafos que roda logo depois, dá no mesmo resultado de um espaço
++    simples quando o número cai no meio do texto de verdade (o reflow
++    ignora linha em branco como sinal de quebra -- só o conteúdo de cada
++    linha decide onde um bloco novo começa). Cogitou-se remover sem
++    deixar espaço nenhum quando o número cai entre duas letras minúsculas
++    (caso de uma palavra hifenizada que a extração já tinha rejuntado
++    antes do rodapé se intrometer, ex: "Fe" + rodapé + "derativa" ->
++    "Federativa") -- mas medindo contra o Vade Mecum real isso erra bem
++    mais vezes do que acerta (a maioria dos casos é só uma quebra de
++    linha comum entre DUAS PALAVRAS DIFERENTES, ex: "que" + rodapé +
++    "possam", que precisa do espaço pra não virar "quepossam"), então
++    fica de fora -- mais seguro mesmo custando o raro caso de uma palavra
++    hifenizada sair com um espaço a mais no meio."""
++    return _RODAPE_NUMERO_RE.sub("\n\n", md_text)
++
++
++def _detectar_e_remover_titulo_lei(trecho: str, lei_atual):
++    """Ver docstring de `_LEI_TITULO_RE`. Devolve
++    (trecho_sem_o_cabecalho, nome_da_lei_atualizado) -- se não achar
++    nada, devolve o trecho como está e mantém `lei_atual`."""
++    m = _LEI_TITULO_RE.search(trecho)
++    if not m:
++        return trecho, lei_atual
++    nova_lei = m.group(1).strip()
++    trecho_limpo = trecho[: m.start()] + " " + trecho[m.end() :]
++    return trecho_limpo, nova_lei
++
++
++def _limpar_e_rotular_paginas(texto: str, titulo_padrao):
+     """Remove os marcadores de quebra de página e o cabeçalho corrente do
+-    livro que aparece logo em seguida -- sem isso, esses dois artefatos
++    livro que aparece logo em seguida -- sem isso, esses artefatos
+     interrompem incisos/parágrafos no meio quando um artigo atravessa uma
+-    quebra de página. Substitui por um espaço simples (mantém a leitura
+-    corrida, sem criar um buraco no texto)."""
++    quebra de página. Ao mesmo tempo, detecta troca de legislação (ver
++    `_LEI_TITULO_RE`) e devolve, junto com o texto limpo, a lista de
++    eventos de página na ordem em que apareceram -- cada evento é
++    `(quantidade_de_artigos_vistos_até_ali, nome_da_lei, numero_da_pagina)`
++    -- usada por `segmentar_legislacao` pra decidir ANTES de qual artigo
++    (nunca no meio de um) inserir o marcador "Nome da lei -- pg N": a
++    quantidade de artigos já vistos naquele ponto é contada sobre o MESMO
++    trecho, já normalizado (`_normalizar_cabecalhos_artigo`), então bate
++    com a ordem dos marcadores que `segmentar_legislacao` encontra depois
++    na segunda passada (mesmo o texto completo sendo renormalizado de
++    novo lá -- normalizar não muda quantos cabeçalhos de artigo existem,
++    só reescreve a forma deles)."""
+     partes = _PAGE_BREAK_RE.split(texto)
+-    saida = [partes[0]]
+-    for trecho in partes[1:]:
+-        m = _RUNNING_HEADER_RE.match(trecho)
+-        if m and (m.group(1) or m.group(3)):
+-            trecho = trecho[m.end() :]
+-        saida.append(" " + trecho.lstrip())
+-    return "".join(saida)
++    saida = []
++    eventos = []
++    lei_atual = titulo_padrao
++    artigos_vistos = 0
++
++    for i in range(0, len(partes) - 1, 2):
++        trecho = partes[i]
++        pagina_num = partes[i + 1]
++        if i > 0:
++            m = _RUNNING_HEADER_RE.match(trecho)
++            if m and (m.group(1) or m.group(3)):
++                trecho = trecho[m.end() :]
++            trecho = " " + trecho.lstrip()
++        trecho, lei_atual = _detectar_e_remover_titulo_lei(trecho, lei_atual)
++        artigos_vistos += len(_ARTIGO_RE.findall(_normalizar_cabecalhos_artigo(trecho)))
++        saida.append(trecho)
++        eventos.append((artigos_vistos, lei_atual, pagina_num))
++    if len(partes) % 2 == 1:
++        saida.append(partes[-1])
++
++    # só mantém o primeiro evento (topo do documento) e os pontos em que a
++    # legislação em vigor realmente muda -- não repete o marcador em toda
++    # página, só "no topo do documento (ou de cada nova lei)".
++    eventos_relevantes = []
++    lei_anterior = object()  # sentinela -- garante que o primeiro evento sempre entra
++    for evento in eventos:
++        if evento[1] != lei_anterior:
++            eventos_relevantes.append(evento)
++        lei_anterior = evento[1]
++
++    return "".join(saida), eventos_relevantes
+ 
+ 
+ def _normalizar_cabecalhos_artigo(texto: str) -> str:
+@@ -271,13 +386,31 @@ def segmentar_artigo(texto_artigo: str) -> str:
+     return "\n".join(linhas).strip()
+ 
+ 
+-def segmentar_legislacao(texto: str) -> str:
++def _bloco_marcador_pagina(lei, pagina_num: str) -> str:
++    """Marcador isolado de página/legislação: '---' (linha horizontal, no
++    padrão que o Obsidian reconhece como separador, com espaço em branco
++    -- linha em branco -- antes e depois), o nome da legislação e o
++    número da página em linha própria, e outro '---' fechando. Nunca
++    entra no meio do texto de um artigo -- ver `segmentar_legislacao`."""
++    rotulo = f"{lei} -- pg {pagina_num}" if lei else f"pg {pagina_num}"
++    return f"\n\n---\n*{rotulo}*\n\n---\n"
++
++
++def segmentar_legislacao(texto: str, titulo_padrao: str = "") -> str:
+     """Recebe o Markdown já extraído (texto corrido, com os marcadores
+     '**Art. N**' preservados) e devolve a versão reestruturada. Trechos que
+     não fazem parte de nenhum artigo (capa, sumário, cabeçalhos de
+     capítulo/seção) são preservados como estão -- só o CONTEÚDO de cada
+-    artigo é reestruturado."""
+-    texto = _limpar_ruido_paginas(texto)
++    artigo é reestruturado.
++
++    `titulo_padrao` é o nome da legislação a mostrar no marcador do topo
++    do documento (ver `_bloco_marcador_pagina`) quando o próprio PDF não
++    tiver um cabeçalho de abertura de lei reconhecível (`_LEI_TITULO_RE`)
++    -- normalmente o título/nome do arquivo, vindo de
++    `converter_pdf_legislacao`. Opcional: os testes deste módulo chamam
++    `segmentar_legislacao` direto, sem simular quebra de página nenhuma,
++    e nesse caso nenhum marcador é inserido."""
++    texto, eventos = _limpar_e_rotular_paginas(texto, titulo_padrao)
+     texto = _normalizar_cabecalhos_artigo(texto)
+     # une um bullet solto ("\n- texto") que às vezes sobra no meio de um
+     # inciso/parágrafo (artefato do reflow de linha do pipeline padrão) --
+@@ -285,10 +418,28 @@ def segmentar_legislacao(texto: str) -> str:
+     texto = re.sub(r"\n\n?-\s*", " ", texto)
+ 
+     marcadores = list(_ARTIGO_RE.finditer(texto))
++
++    # agrupa os eventos de página pelo índice do artigo em questão (ver
++    # `_limpar_e_rotular_paginas`) -- índice 0 = antes do primeiro
++    # artigo, índice N = depois do artigo de índice N-1. Nunca insere no
++    # meio de um artigo: sempre num limite entre dois artigos (ou antes
++    # do primeiro / depois do último).
++    marcadores_por_indice = {}
++    for indice_artigos, lei, pagina_num in eventos:
++        idx = min(indice_artigos, len(marcadores))
++        marcadores_por_indice.setdefault(idx, []).append((lei, pagina_num))
++
+     if not marcadores:
+-        return texto
++        prefixo = "".join(
++            _bloco_marcador_pagina(lei, pagina_num)
++            for lei, pagina_num in marcadores_por_indice.get(0, [])
++        )
++        return f"{prefixo}\n{texto}" if prefixo else texto
+ 
+     partes = [texto[: marcadores[0].start()]]
++    for lei, pagina_num in marcadores_por_indice.get(0, []):
++        partes.append(_bloco_marcador_pagina(lei, pagina_num))
++
+     for idx, m in enumerate(marcadores):
+         numero = m.group(1) + (f"-{m.group(2)}" if m.group(2) else "")
+         fim_artigo = marcadores[idx + 1].start() if idx + 1 < len(marcadores) else len(texto)
+@@ -297,6 +448,9 @@ def segmentar_legislacao(texto: str) -> str:
+         estruturado = segmentar_artigo(corpo_bruto)
+         partes.append(f"\n\n#### Art. {numero}\n\n{estruturado}\n")
+ 
++        for lei, pagina_num in marcadores_por_indice.get(idx + 1, []):
++            partes.append(_bloco_marcador_pagina(lei, pagina_num))
++
+     return "".join(partes)
+ 
+ 
+@@ -314,16 +468,21 @@ def converter_pdf_legislacao(input_path: str, job_dir: str, meta: dict) -> dict:
+         doc.close()
+ 
+     raw_md = pymupdf4llm.to_markdown(input_path, write_images=False, page_separators=True)
++    # remove o número de página solto no rodapé (ver `_RODAPE_NUMERO_RE`)
++    # ANTES do reflow de parágrafos -- que é o passo (dentro de
++    # `_base.process_pages`, chamado logo abaixo) que colaria esse número
++    # no meio da palavra/frase seguinte se ele não fosse removido antes.
++    raw_md = _remover_rodape_numeros_pagina(raw_md)
+     raw_md = _base._aplicar_ocr_manual(raw_md, ocr_por_pagina)
+     paginado = _base.process_pages(raw_md)
+     limpo = _base.normalize_markdown_text(paginado)
+ 
+-    estruturado = segmentar_legislacao(limpo)
+-    n_artigos = len(_ARTIGO_RE.findall(limpo))
+-
+     nome = meta.get("display_name") or _base.slugify(meta.get("original_filename", "legislacao"))
+     titulo = meta.get("titulo") or nome
+ 
++    estruturado = segmentar_legislacao(limpo, titulo)
++    n_artigos = len(_ARTIGO_RE.findall(limpo))
++
+     cabecalho = (
+         f"# {titulo}\n\n"
+         "> Markdown de legislação gerado pelo docintel -- estrutura "
+diff --git a/tests/test_converter.py b/tests/test_converter.py
+index c07712a..1cf48b9 100755
+--- a/tests/test_converter.py
++++ b/tests/test_converter.py
+@@ -125,6 +125,41 @@ class ApostilaOnlyTests(unittest.TestCase):
+         self.assertIn("1ª) Remédio Constitucional decidido.", blocos)
+         self.assertIn("2ª) Da decisão prolatada.", blocos)
+ 
++    def test_reflow_apostila_nests_indented_subtopics_instead_of_flattening(self):
++        # bug real (DCA1.pdf, pág. 5): "Características fundamentais:" e
++        # seus sub-itens indentados no PDF ("Hereditariedade:",
++        # "Vitaliciedade:", "Irresponsabilidade política do monarca")
++        # saíam todos grudados num único parágrafo achatado. Cada
++        # sub-item indentado deve virar um bloco filho aninhado (prefixo
++        # "  "), não texto solto colado no bloco pai.
++        raw = (
++            "- Características fundamentais:\n"
++            "   - Hereditariedade: Governante não é eleito\n"
++            "   - Vitaliciedade: Não existe mandato pré-fixado\n"
++            "   - Irresponsabilidade política do monarca\n"
++        )
++        out = converter.reflow_paragraphs_apostila(raw)
++        blocos = out.split("\n\n")
++        self.assertEqual(
++            blocos,
++            [
++                "- Características fundamentais:",
++                "  - Hereditariedade: Governante não é eleito",
++                "  - Vitaliciedade: Não existe mandato pré-fixado",
++                "  - Irresponsabilidade política do monarca",
++            ],
++        )
++
++    def test_reflow_apostila_indented_continuation_without_marker_still_joins(self):
++        # uma linha indentada que NÃO comece com marcador de bloco
++        # reconhecido continua sendo tratada como simples continuação do
++        # bloco aberto (comportamento anterior preservado -- só linhas
++        # indentadas que abrem sub-tópico novo viram bloco aninhado).
++        raw = "-Assim, ou em conjunto com\n   AGU/PGE ou outro advogado habilitado).\n"
++        out = converter.reflow_paragraphs_apostila(raw)
++        self.assertEqual(out.count("\n\n"), 0)
++        self.assertIn("-Assim, ou em conjunto com AGU/PGE ou outro advogado habilitado).", out)
++
+     def test_processar_indice_wraps_and_nests(self):
+         md = (
+             "**Sumário**\n\n"
+@@ -172,10 +207,35 @@ class ApostilaOnlyTests(unittest.TestCase):
+         out = converter._destacar_citacoes_de_lei(md)
+         blocos = out.split("\n\n")
+         self.assertEqual(len(blocos), 2)  # citação (caput+inciso juntos) + comentário
+-        self.assertTrue(blocos[0].startswith("> [!quote] Texto de lei"))
++        # callout sem título (espaço depois do "]"), "LEI" como primeira
++        # linha do corpo -- não como título do callout.
++        self.assertTrue(blocos[0].startswith("> [!quote] \n> LEI\n"))
+         self.assertIn("> II - julgar, em recurso ordinário", blocos[0])
+         self.assertEqual(blocos[1], "Comentário da professora depois da citação.")
+ 
++    def test_destacar_jurisprudencia_wraps_adpf_citation(self):
++        md = (
++            "**ADPF 54/DF, rel. Min. Marco Aurélio:** O Plenário, por maioria, julgou procedente "
++            "pedido formulado em arguição de descumprimento de preceito fundamental.\n\n"
++            "Comentário da professora depois da jurisprudência."
++        )
++        out = converter._destacar_jurisprudencia(md)
++        blocos = out.split("\n\n")
++        self.assertEqual(len(blocos), 2)
++        self.assertTrue(blocos[0].startswith("> [!warning] Jurisprudência\n"))
++        self.assertIn("> **ADPF 54/DF, rel. Min. Marco Aurélio:**", blocos[0])
++        self.assertEqual(blocos[1], "Comentário da professora depois da jurisprudência.")
++
++    def test_destacar_jurisprudencia_wraps_sumula_vinculante(self):
++        md = '**Súmula Vinculante 11:** "Só é lícito o uso de algemas em casos de resistência."'
++        out = converter._destacar_jurisprudencia(md)
++        self.assertTrue(out.startswith("> [!warning] Jurisprudência\n> **Súmula Vinculante 11:**"))
++
++    def test_destacar_jurisprudencia_does_not_touch_unrelated_text(self):
++        md = "Texto comum de comentário da professora, sem citação de jurisprudência nenhuma."
++        out = converter._destacar_jurisprudencia(md)
++        self.assertEqual(out, md)
++
+     def test_sup_footnote_roundtrip_through_process_pages_apostila(self):
+         raw = (
+             "Texto com nota. <sup>1</sup>\n\n"
