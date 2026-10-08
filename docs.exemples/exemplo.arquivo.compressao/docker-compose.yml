@@ -1,9 +1,0 @@
-services:
-  vavilov:
-    build: .
-    container_name: vavilov-small-pdf
-    restart: unless-stopped
-    ports:
-      - "8095:8095"
-    volumes:
-      - ./uploads:/app/uploads

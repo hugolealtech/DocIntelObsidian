@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import sys
 import tempfile
 import unittest
@@ -90,6 +91,9 @@ G7JURIDICO<br><!-- End of picture text -->
             with open(result["md_path"], encoding="utf-8") as markdown_file:
                 derecho_markdown = markdown_file.read()
             self.assertIn("![[derecho-table1-pg1.png]]", derecho_markdown)
+            self.assertIn("> [!note]- Texto da tabela", derecho_markdown)
+            self.assertNotIn("|---|", derecho_markdown)
+            self.assertEqual(result["n_images"], 1)
 
             logic_dir = os.path.join(temp_dir, "logic-output")
             result = converter.convert_pdf(
@@ -101,6 +105,203 @@ G7JURIDICO<br><!-- End of picture text -->
                 logic_markdown = markdown_file.read()
             self.assertIn("|---|---|---|---|", logic_markdown)
             self.assertEqual(result["n_images"], 0)
+
+    def test_derecho_profile_uses_nonwhite_table_background_as_image_clue(self):
+        import pymupdf
+        from PIL import Image
+
+        def make_pdf(path, fill, embedded=False, page_number=1):
+            doc = pymupdf.open()
+            if page_number == 2:
+                doc.new_page(width=300, height=240)
+            page = doc.new_page(width=300, height=240)
+            if fill:
+                if embedded:
+                    background = os.path.splitext(path)[0] + ".png"
+                    Image.new("RGB", (110, 100), (140, 184, 230)).save(background)
+                    page.insert_image(
+                        pymupdf.Rect(40, 60, 150, 160),
+                        filename=background,
+                    )
+                else:
+                    page.draw_rect(
+                        pymupdf.Rect(40, 60, 150, 160),
+                        color=None,
+                        fill=(0.55, 0.72, 0.9),
+                    )
+            for x in (40, 95, 150):
+                page.draw_line((x, 60), (x, 160))
+            for y in (60, 110, 160):
+                page.draw_line((40, y), (150, y))
+            page.insert_text((50, 90), "A")
+            page.insert_text((105, 90), "B")
+            page.insert_text((50, 140), "C")
+            page.insert_text((105, 140), "D")
+            doc.save(path)
+            doc.close()
+
+        markdown = "|A|B|\n|---|---|\n|C|D|"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_dir = os.path.join(temp_dir, "images")
+            os.makedirs(image_dir)
+            colored_pdf = os.path.join(temp_dir, "colored.pdf")
+            white_pdf = os.path.join(temp_dir, "white.pdf")
+            vector_pdf = os.path.join(temp_dir, "vector.pdf")
+            make_pdf(colored_pdf, True, embedded=True, page_number=2)
+            make_pdf(white_pdf, False)
+            make_pdf(vector_pdf, True)
+
+            colored_output = converter._renderizar_tabelas_como_imagens(
+                markdown + "\n\n---\n*p. 2*\n\n---\n\n",
+                colored_pdf,
+                image_dir,
+                "colored",
+            )
+            white_output = converter._renderizar_tabelas_como_imagens(
+                markdown, white_pdf, image_dir, "white"
+            )
+            vector_output = converter._renderizar_tabelas_como_imagens(
+                markdown, vector_pdf, image_dir, "vector"
+            )
+
+            self.assertIn("![[colored-table1-pg2.png]]", colored_output)
+            self.assertNotIn("|---|", colored_output)
+            self.assertIn("|---|---|", white_output)
+            self.assertIn("|---|---|", vector_output)
+
+    def test_derecho_profile_recombines_fragmented_colored_images(self):
+        import pymupdf
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = os.path.join(temp_dir, "fragments.pdf")
+            image_dir = os.path.join(temp_dir, "images")
+            os.makedirs(image_dir)
+            top_path = os.path.join(temp_dir, "top.png")
+            bottom_path = os.path.join(temp_dir, "bottom.png")
+            Image.new("RGB", (180, 50), (90, 145, 205)).save(top_path)
+            Image.new("RGB", (180, 50), (180, 205, 230)).save(bottom_path)
+
+            doc = pymupdf.open()
+            doc.new_page(width=300, height=300)
+            page = doc.new_page(width=300, height=300)
+            page.insert_image(pymupdf.Rect(20, 80, 200, 130), filename=top_path)
+            page.insert_image(pymupdf.Rect(20, 130, 200, 180), filename=bottom_path)
+            doc.save(pdf_path)
+            doc.close()
+
+            markdown = (
+                "Texto antes.\n\n"
+                "![](fragment-a.png)\n\n"
+                "![](fragment-b.png)\n\n"
+                "Texto depois.\n\n---\n*p. 2*\n\n---\n\n"
+            )
+            output = converter._renderizar_imagens_coloridas_fragmentadas(
+                markdown, pdf_path, image_dir, "fragments"
+            )
+
+            self.assertEqual(output.count("![[fragments-figure-pg2.png]]"), 1)
+            self.assertNotIn("![](", output)
+            self.assertIn("Texto antes.", output)
+            self.assertIn("Texto depois.", output)
+            self.assertTrue(
+                os.path.isfile(os.path.join(image_dir, "fragments-figure-pg2.png"))
+            )
+
+    def test_convert_pdf_overwrites_stale_image_file(self):
+        import pymupdf
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = os.path.join(temp_dir, "source.pdf")
+            output_dir = os.path.join(temp_dir, "output")
+            image_dir = os.path.join(output_dir, "images")
+            os.makedirs(image_dir)
+            source_image = os.path.join(temp_dir, "source.png")
+            Image.new("RGB", (100, 100), (255, 0, 0)).save(source_image)
+
+            doc = pymupdf.open()
+            page = doc.new_page(width=300, height=300)
+            page.insert_text(
+                (20, 25),
+                "This page has enough native text to avoid the OCR-only path and "
+                "provide enough searchable content for the converter to retain it.",
+            )
+            page.insert_image(pymupdf.Rect(20, 40, 130, 140), filename=source_image)
+            doc.save(pdf_path)
+            doc.close()
+
+            stale_image = os.path.join(image_dir, "sample-img1-pg1.png")
+            Image.new("RGB", (8, 8), (0, 0, 255)).save(stale_image)
+
+            converter.convert_pdf(
+                pdf_path,
+                output_dir,
+                {"slug": "sample", "display_name": "sample", "disciplina": "Lógica"},
+            )
+
+            with Image.open(stale_image) as generated:
+                self.assertGreater(generated.width, 8)
+                self.assertGreater(generated.height, 8)
+                self.assertGreater(generated.getpixel((generated.width // 2, generated.height // 2))[0], 200)
+
+    def test_image_anchors_can_use_ocr_text_blocks(self):
+        import pymupdf
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = os.path.join(temp_dir, "anchor.pdf")
+            image_path = os.path.join(temp_dir, "pixel.png")
+            Image.new("RGB", (10, 10), "white").save(image_path)
+            doc = pymupdf.open()
+            page = doc.new_page(width=200, height=200)
+            page.insert_image(pymupdf.Rect(20, 100, 80, 160), filename=image_path)
+            doc.save(pdf_path)
+            doc.close()
+
+            with pymupdf.open(pdf_path) as doc:
+                page = doc[0]
+                ocr_blocks = {
+                    0: [
+                        {
+                            "type": 0,
+                            "bbox": (20, 30, 150, 45),
+                            "lines": [
+                                {
+                                    "spans": [{"text": "OCR texto antes da figura"}],
+                                }
+                            ],
+                        }
+                    ]
+                }
+
+                self.assertEqual(
+                    converter._ancoras_de_imagem_por_pagina(doc, ocr_blocks),
+                    {0: ["OCR texto antes da figura"]},
+                )
+
+    def test_missing_tesseract_stops_conversion_when_ocr_is_required(self):
+        import pymupdf
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = os.path.join(temp_dir, "scanned.pdf")
+            doc = pymupdf.open()
+            doc.new_page(width=100, height=100)
+            doc.save(pdf_path)
+            doc.close()
+
+            with pymupdf.open(pdf_path) as doc:
+                with patch.object(
+                    pymupdf.Page,
+                    "get_textpage_ocr",
+                    side_effect=RuntimeError(
+                        "No tessdata specified and Tesseract is not installed"
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "Tesseract não está instalado"
+                    ):
+                        converter._paginas_sem_texto_nativo(doc)
 
     def test_slugify_uses_safe_name(self):
         self.assertEqual(converter.slugify("DCA4.pdf"), "dca4")
@@ -250,6 +451,7 @@ G7JURIDICO<br><!-- End of picture text -->
             doc = pymupdf.open()
             page = doc.new_page(width=400, height=500)
             page.insert_text((40, 60), "ROTEIRO DE AULA", fontname="hebo", fontsize=14)
+            page.insert_text((40, 400), "Texto nativo de apoio para impedir o OCR integral desta página.")
             image = Image.new("RGB", (300, 100), "white")
             image_buffer = io.BytesIO()
             image.save(image_buffer, format="PNG")
@@ -266,14 +468,14 @@ G7JURIDICO<br><!-- End of picture text -->
             with open(result["md_path"], encoding="utf-8") as markdown_file:
                 markdown = markdown_file.read()
 
-            image_path = os.path.join(temp_dir, "output", "images", "Current_Stem-pg1-fig1.png")
+            image_path = os.path.join(temp_dir, "output", "images", "source-img1-pg1.png")
             self.assertTrue(os.path.isfile(image_path))
             with Image.open(image_path) as merged:
                 self.assertEqual(merged.size, (300, 200))
 
         self.assertEqual(result["n_images"], 1)
-        self.assertIn("### ROTEIRO DE AULA", markdown)
-        self.assertLess(markdown.index("### ROTEIRO DE AULA"), markdown.index("![[Current_Stem-pg1-fig1.png]]"))
+        self.assertIn("#### ROTEIRO DE AULA", markdown)
+        self.assertLess(markdown.index("#### ROTEIRO DE AULA"), markdown.index("![[source-img1-pg1.png]]"))
         self.assertNotIn("[[ROTEIRO DE AULA]]", markdown)
 
     def test_visual_title_levels_follow_numbering_and_leave_prose_unmarked(self):
@@ -283,15 +485,15 @@ G7JURIDICO<br><!-- End of picture text -->
         state = {"nivel": None}
         self.assertEqual(
             converter._texto_linha_pdf(make_line("3. Título principal"), state),
-            "### 3. Título principal",
+            "#### 3. Título principal",
         )
         self.assertEqual(
             converter._texto_linha_pdf(make_line("3.1 Subtítulo"), state),
-            "#### 3.1 Subtítulo",
+            "##### 3.1 Subtítulo",
         )
         self.assertEqual(
             converter._texto_linha_pdf(make_line("3.1.2 Neto"), state),
-            "##### 3.1.2 Neto",
+            "###### 3.1.2 Neto",
         )
         self.assertEqual(
             converter._texto_linha_pdf(make_line("3.1.2.4 Profundidade máxima"), state),
@@ -311,7 +513,7 @@ G7JURIDICO<br><!-- End of picture text -->
         )
         self.assertEqual(
             converter._texto_linha_pdf(make_line("### 3.1 Título já marcado"), state),
-            "#### 3.1 Título já marcado",
+            "##### 3.1 Título já marcado",
         )
 
     def test_crop_watermark_is_disabled_by_default_and_explicit_when_requested(self):
@@ -322,6 +524,7 @@ G7JURIDICO<br><!-- End of picture text -->
             pdf_path = os.path.join(temp_dir, "watermark.pdf")
             doc = pymupdf.open()
             page = doc.new_page(width=400, height=500)
+            page.insert_text((40, 60), "Texto nativo suficiente para dispensar OCR nesta página.")
             image = Image.new("RGB", (300, 200), "white")
             image_buffer = io.BytesIO()
             image.save(image_buffer, format="PNG")
@@ -340,9 +543,9 @@ G7JURIDICO<br><!-- End of picture text -->
                     crop_watermark=True,
                 )
 
-            with Image.open(os.path.join(default_dir, "images", "watermark-pg1-fig1.png")) as default_image:
+            with Image.open(os.path.join(default_dir, "images", "watermark-img1-pg1.png")) as default_image:
                 self.assertEqual(default_image.size, (300, 200))
-            with Image.open(os.path.join(crop_dir, "images", "watermark-pg1-fig1.png")) as cropped_image:
+            with Image.open(os.path.join(crop_dir, "images", "watermark-img1-pg1.png")) as cropped_image:
                 self.assertEqual(cropped_image.size, (282, 188))
 
 
@@ -425,9 +628,9 @@ class ApostilaOnlyTests(unittest.TestCase):
             "Texto normal do corpo da aula."
         )
         out = converter._processar_indice(md)
-        self.assertIn("### Sumário", out)
-        self.assertIn("### Controle de constitucionalidade", out)
-        self.assertIn("#### 1- Teoria Geral", out)
+        self.assertIn("#### Sumário", out)
+        self.assertIn("#### Controle de constitucionalidade", out)
+        self.assertIn("##### 1- Teoria Geral", out)
         self.assertNotIn("[[Sumário]]", out)
         self.assertNotIn("[[Controle de constitucionalidade]]", out)
         # não mexe no que vem depois do índice
@@ -444,11 +647,208 @@ class ApostilaOnlyTests(unittest.TestCase):
         out = converter._formatar_bloco_assunto(linhas)
         self.assertEqual(
             out,
-            "### 3. Poder Executivo\n"
-            "#### 3.1 exercício do poder executivo\n"
-            "#### 3.6 Imunidades do Presidente\n"
-            "##### 3.1.2 Competências",
+            "#### 3. Poder Executivo\n"
+            "##### 3.1 exercício do poder executivo\n"
+            "##### 3.6 Imunidades do Presidente\n"
+            "###### 3.1.2 Competências",
         )
+
+    def test_positional_heading_levels_follow_numbering_depth(self):
+        def line(text):
+            return {
+                "text": text,
+                "bold": True,
+                "any_bold": True,
+                "centered": False,
+                "size": 12,
+                "bbox": (20, 20, 200, 34),
+                "height": 14,
+                "spans": [],
+            }
+
+        heading_styles, median = converter._rank_heading_styles(
+            [line("8. TABELA-VERDADE"), line("8.1 TAUTOLOGIA"), line("7.2.10 Conectivo")]
+        )
+        self.assertEqual(
+            [
+                converter._nivel_heading_posicional(line(text), heading_styles, median)
+                for text in (
+                    "8. TABELA-VERDADE",
+                    "8.1 TAUTOLOGIA",
+                    "7.2.10 Conectivo",
+                )
+            ],
+            [4, 5, 6],
+        )
+        partial_bold = line("“Art. 102, CF/88:** Compete ao STF")
+        partial_bold["bold"] = False
+        partial_bold["any_bold"] = True
+        self.assertEqual(
+            converter._nivel_heading_posicional(
+                partial_bold, heading_styles, median
+            ),
+            None,
+        )
+
+    def test_positional_heading_recognizes_scan_titles_and_summary(self):
+        summary = {"text": "Sumário", "bbox": (54, 382, 92, 390)}
+        scanned_title = {
+            "text": "DIREITO DA CRIANÇA E DO ADOLESCENTE",
+            "bbox": (54, 96, 243, 105),
+            "page_height": 792,
+            "page_width": 612,
+        }
+        self.assertEqual(
+            converter._nivel_heading_posicional(summary, {}, 10), 4
+        )
+        self.assertEqual(
+            converter._nivel_heading_posicional(scanned_title, {}, 10), 4
+        )
+
+    def test_positional_heading_accepts_compact_uppercase_scan_titles_only(self):
+        compact = {
+            "text": "NORMATIVIDADE INTERNA",
+            "bbox": (245, 432, 368, 440),
+            "centered": True,
+            "size": 9.5,
+            "height": 7.5,
+            "bold": False,
+            "any_bold": False,
+            "page_height": 792,
+            "page_width": 612,
+        }
+        long_numbered_prose = {
+            **compact,
+            "text": (
+                "1 — FASE DA ABSOLUTA INDIFERENÇA— Não havia proteção da "
+                "criança e do adolescente. Sujeitas exclusivamente"
+            ),
+        }
+        split_sentence = {
+            **compact,
+            "text": "ATENÇÃO! A",
+            "bold": True,
+            "any_bold": True,
+        }
+        self.assertEqual(converter._nivel_heading_posicional(compact, {}, 10), 4)
+        self.assertIsNone(
+            converter._nivel_heading_posicional(long_numbered_prose, {}, 10)
+        )
+        self.assertIsNone(
+            converter._nivel_heading_posicional(split_sentence, {}, 10)
+        )
+
+    def test_positional_numeric_fragments_on_same_row_are_joined(self):
+        def line(text, bbox):
+            return {
+                "text": text,
+                "bbox": bbox,
+                "spans": [{"text": text, "bbox": bbox}],
+            }
+
+        merged = converter._combinar_fragmentos_numericos(
+            [
+                line("DIREITO DA CRIANÇA", (91, 403, 275, 413)),
+                line("1.", (73, 403, 80, 413)),
+            ]
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["text"], "1. DIREITO DA CRIANÇA")
+        self.assertTrue(converter._OUTLINE_RE.match(merged[0]["text"]))
+
+    def test_positional_line_text_uses_span_geometry_for_word_spaces(self):
+        line = {
+            "text": "DIREITODA",
+            "size": 10,
+            "spans": [
+                {"text": "DIREITO", "bbox": (54, 96, 90, 105), "flags": 0},
+                {"text": "DA", "bbox": (91, 96, 106, 105), "flags": 0},
+            ],
+        }
+        self.assertEqual(
+            converter._texto_spans_geometricamente(line["spans"], line["size"]),
+            "DIREITO DA",
+        )
+        self.assertEqual(
+            converter._formatar_linha_posicional(line, 54),
+            "DIREITO DA",
+        )
+
+    def test_vector_figure_detection_ignores_page_background_frame(self):
+        import pymupdf
+
+        doc = pymupdf.open()
+        page = doc.new_page(width=300, height=400)
+        page.draw_rect(page.rect, color=(0, 0, 0), fill=(1, 1, 1))
+        page.draw_rect(
+            pymupdf.Rect(60, 100, 240, 250),
+            color=(0.2, 0.4, 0.7),
+            fill=(0.8, 0.9, 1.0),
+        )
+        figures = converter._figuras_vetoriais_da_pagina(page, [])
+        self.assertEqual(len(figures), 1)
+        self.assertLess(figures[0]["bbox"][1], 150)
+        doc.close()
+
+    def test_ocr_site_cleaner_removes_g7_juridico_variants(self):
+        cleaned = converter._limpar_ocr_site("G7 JURÍDICO\nTexto útil")
+        self.assertEqual(cleaned, "Texto útil")
+
+    def test_positional_bullet_noise_becomes_markdown_list_item(self):
+        for source in ("= item", "* item", "+ item", "QO) item", "* | item", "▪ item"):
+            marker, text_x = converter._detectar_marcador_posicional(
+                [], source, (36, 40, 500, 55)
+            )
+            self.assertIsNotNone(marker, source)
+            line = {
+                "text": source,
+                "bbox": (36, 40, 500, 55),
+                "list_marker": marker,
+                "list_text_x": text_x,
+                "spans": [],
+            }
+            self.assertEqual(converter._formatar_linha_posicional(line, 36), "- item")
+
+    def test_positional_extractor_keeps_images_between_text_and_all_page_markers(self):
+        import pymupdf
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = os.path.join(temp_dir, "layout.pdf")
+            image_path = os.path.join(temp_dir, "figure.png")
+            image_dir = os.path.join(temp_dir, "images")
+            os.makedirs(image_dir)
+            Image.new("RGB", (80, 50), (220, 190, 130)).save(image_path)
+            doc = pymupdf.open()
+            first = doc.new_page(width=400, height=500)
+            first.insert_text((35, 45), "Texto suficiente antes da figura para evitar OCR.")
+            first.insert_image(pymupdf.Rect(80, 100, 280, 210), filename=image_path)
+            first.insert_text((35, 250), "Texto suficiente depois da figura e na mesma página.")
+            first.insert_text((35, 480), "1")
+            second = doc.new_page(width=400, height=500)
+            second.insert_text((35, 45), "Segunda página preservada com conteúdo nativo completo.")
+            second.insert_text((35, 480), "2")
+            doc.save(pdf_path)
+            doc.close()
+
+            markdown, images = converter._extrair_layout_pdf(
+                pdf_path, image_dir, "layout"
+            )
+
+            self.assertEqual(images, 1)
+            self.assertEqual(
+                re.findall(r"^\*p\. (\d+)\*$", markdown, re.MULTILINE),
+                ["1", "2"],
+            )
+            self.assertLess(
+                markdown.index("Texto suficiente antes"),
+                markdown.index("![[layout-img1-pg1.png]]"),
+            )
+            self.assertLess(
+                markdown.index("![[layout-img1-pg1.png]]"),
+                markdown.index("Texto suficiente depois"),
+            )
+            self.assertIn("Segunda página preservada", markdown)
 
     def test_alerta_callout_wraps_obs_with_leading_bullet_dash(self):
         # a apostila abre o aviso com um "-" de tópico antes da palavra-gatilho
@@ -518,7 +918,31 @@ class ApostilaOnlyTests(unittest.TestCase):
         out = converter._normalizar_marcadores_apostila(raw)
         self.assertIn("**Tipologias**\n", out)
         self.assertNotIn("⮚", out)
-        self.assertIn("- O Poder Executivo pode se estruturar.", out)
+        self.assertIn(
+            f"{converter._MARCADOR_TOPICO_CONVERTIDO} O Poder Executivo pode se estruturar.",
+            out,
+        )
+
+    def test_process_pages_apostila_preserves_literal_and_converted_list_markers(self):
+        raw = (
+            "- Item com hífen literal\n\n"
+            "❖ Item com marcador decorativo\n\n"
+            "  ➢ Subitem decorativo indentado\n\n"
+            "- Outro item com hífen literal"
+        )
+        out, _ = converter.process_pages_apostila(raw)
+        blocos = out.split("\n\n")
+
+        self.assertEqual(
+            blocos,
+            [
+                "- Item com hífen literal",
+                "- Item com marcador decorativo",
+                "  - Subitem decorativo indentado",
+                "- Outro item com hífen literal",
+            ],
+        )
+        self.assertNotIn(converter._MARCADOR_TOPICO_CONVERTIDO, out)
 
     def test_remover_sites_residuais_strips_footer_but_preserves_inline_links(self):
         raw = (

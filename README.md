@@ -18,6 +18,11 @@ Acesse: `http://<endereço-do-seu-servidor>:8097`
 Não precisa de mais nada — o `docker-compose.yml` já cria as pastas
 `uploads/`, `output/` e `data/` como volumes na primeira execução.
 
+Para executar o conversor diretamente no macOS, fora do container, instale o
+Tesseract e os dados de idioma português/inglês com `brew install tesseract
+tesseract-lang`. O conversor interrompe a execução com erro explícito se um PDF
+precisar de OCR e o Tesseract não estiver disponível.
+
 ## Uso
 
 1. Abra a interface web, arraste um ou vários PDFs (ou clique para escolher).
@@ -72,11 +77,11 @@ o campo sai vazio — sem tentar adivinhar.
 
 **As imagens** são embutidas no formato wikilink do Obsidian (`![[nome.png]]`),
 igual ao padrão nativo de colar imagem no Obsidian — não precisa de caminho
-relativo, o Obsidian resolve pelo vault inteiro. Em PDFs de aula com páginas
-predominantemente visuais, texto e imagens são ordenados pelas coordenadas da
-página. Tiras adjacentes de mesma largura são empilhadas em uma figura quando
-a distância entre bordas é de até 3 unidades da página. Os arquivos seguem o
-padrão `<nome-do-pdf>-pg<N>-fig<K>.png`, preservando o nome do PDF enviado.
+relativo, o Obsidian resolve pelo vault inteiro. Em todos os PDFs de aula,
+texto, tabelas nativas e figuras são ordenados pelas coordenadas da página.
+Tiras adjacentes de mesma largura são empilhadas numa figura quando a distância
+entre bordas é de até 3 unidades da página. Os arquivos seguem o padrão
+`<slug>-img<N>-pg<P>.png`, com índice global e número físico da página.
 
 Cada figura continua sendo a fonte visual principal. Como o projeto não usa
 um modelo de visão, o Tesseract gera apenas texto aproximado dentro de um
@@ -84,11 +89,12 @@ callout recolhido (`> [!note]- Texto OCR (aproximado)`), para busca; esse OCR
 não é inserido como texto normal do enunciado. A ordem do Markdown intercala
 headings, texto nativo e figuras conforme sua posição no PDF.
 
-**O índice/sumário do início do documento** (título de seção + itens
-numerados do "assuntos de hoje", igual aparece nos slides) vira uma hierarquia
-de headings Markdown: o título principal usa `#`, filhos `####` e netos
-`#####`. Títulos em negrito também são preservados como headings, sem
-wikilinks automáticos.
+**Títulos e subtítulos** viram headings Markdown a partir de nível 4
+(`####`–`######`), para não interferir nos níveis superiores do outline do
+Obsidian. A hierarquia é inferida por numeração, estilo tipográfico e posição;
+negrito parcial permanece ênfase no corpo. O sumário mantém sua posição no
+fluxo do PDF, e seus itens reconhecidos também são registrados em `assunto`
+no front matter.
 
 **Avisos didáticos** (linhas que começam com "Obs.", "Observação",
 "Atenção", "Cuidado", "Não se esqueça...") viram um callout
@@ -122,25 +128,25 @@ o que é pior que deixar em branco pra você revisar manualmente.
 
 ## Como funciona
 
-- **Extração**: PDFs textuais continuam usando PyMuPDF4LLM. Em PDFs de aula
-  com alta cobertura de imagem e pouco texto nativo, PyMuPDF ordena blocos de
-  texto e imagem pelas coordenadas, funde tiras adjacentes e mantém a figura
-  no local correto do Markdown.
-- **OCR automático, mas controlado por nós.** O pymupdf4llm ≥1.28 vem com
-  um classificador automático (ONNX) que decide sozinho quando rodar OCR --
-  e ele erra especificamente em páginas que misturam uma imagem grande
-  (capa, logo) com bastante texto nativo: classifica a página inteira como
-  "escaneada" e o OCR *substitui* o texto nativo real, apagando conteúdo em
-  silêncio. Por isso o docintel desativa esse classificador
-  (`pymupdf4llm.use_layout(False)`) e faz a própria checagem: no pipeline
-  textual, OCR manual só roda nas páginas sem texto nativo; no pipeline
-  visual, OCR das figuras é apresentado apenas em callout recolhido para
-  busca, sem substituir a imagem nem entrar como corpo do enunciado.
+- **Extração posicional**: PyMuPDF fornece as linhas de texto, tabelas e
+  imagens com suas coordenadas. Tabelas nativas são escritas em Markdown;
+  quadros visuais e clusters vetoriais preenchidos são renderizados como
+  figuras. Para evitar transformar o desenho da página inteira em figura, os
+  clusters vetoriais consideram apenas preenchimentos coloridos e molduras
+  grandes menores que a página. Linhas OCR/nativas sobrepostas a uma figura
+  não são repetidas no corpo.
+- **OCR seletivo**: só páginas com menos de 30 caracteres nativos recebem OCR
+  de página inteira (`por+eng`, 300 DPI). O OCR usa a mesma ordem geométrica;
+  o texto reconhecido dentro de figuras fica em callout recolhido, não como
+  texto principal. Em páginas nativas, o OCR pode ser aplicado ao recorte da
+  figura para busca e para a opção de corte de marca d'água.
+- `pymupdf4llm.use_layout(False)` permanece ativo para o pipeline de
+  legislação, evitando que seu classificador ONNX substitua texto nativo.
 - **Símbolos lógicos**: variantes ASCII/OCR são normalizadas para Unicode
   somente em contexto de fórmula (por exemplo, `P v Q` → `P ∨ Q`, `P > Q` →
   `P ⇒ Q`, `P = Q` → `P ⇔ Q`). Letras `v`, `A` e símbolos semelhantes na
   prosa não são substituídos fora desse contexto.
-- **Rodapés**: a faixa inferior (7% da página) é ignorada na extração visual;
+- **Rodapés**: a faixa inferior (7% da página) é ignorada pela posição;
   URLs/domínios reconhecidos são removidos inclusive quando têm espaços ou
   erros comuns de OCR. Links legítimos no corpo são preservados.
 - **Progresso real de upload**: a interface mostra o envio byte a byte (não

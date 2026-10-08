@@ -9,27 +9,21 @@ nota do vault de Hugo:
 - imagens extraídas para uma subpasta images/, referenciadas como
   embeds wikilink do Obsidian (![[arquivo.png]])
 
-## Sobre a extração de texto e OCR (leia antes de mexer aqui)
+## Sobre a extração posicional e OCR (leia antes de mexer aqui)
 
-pymupdf4llm >= 1.28 ativa por padrão um motor de layout baseado em ONNX
-(pymupdf.layout) que, entre outras coisas, usa um classificador de ML pra
-decidir página por página se deve rodar OCR. Esse classificador erra em
-páginas que têm uma imagem grande (ex: um logo/capa) MISTURADA com bastante
-texto nativo: ele classifica a página inteira como "precisa de OCR", roda
-Tesseract sobre o render da página, e o resultado SUBSTITUI o texto nativo
--- descartando silenciosamente todo o texto digital real que já estava lá
-(sobra só o texto que o OCR conseguiu ler dentro/perto da imagem). Não é
-um "quase certo com ruído": o conteúdo desaparece por completo, sem aviso.
+O pipeline de apostilas usa PyMuPDF diretamente como fonte da ordem: texto,
+imagens e figuras são eventos ordenados pelas coordenadas de cada página.
+Isso evita que um Markdown intermediário mova todas as imagens para o início
+ou para o fim do texto.
 
-Por isso aqui é feito o oposto do que a lib faz por padrão:
-1. `pymupdf4llm.use_layout(False)` desliga esse motor ONNX/classificador e
-   volta pro caminho de extração "legado", que nunca substitui texto nativo
-   por OCR (ele só lê o que já está no PDF).
-2. Como o caminho legado não faz OCR nenhum sozinho, OCR é feito aqui
-   manualmente, mas só nas páginas onde a extração nativa (via PyMuPDF puro)
-   não encontrou texto nenhum -- ou seja, só em páginas genuinamente
-   escaneadas. Páginas com texto nativo nunca passam por OCR, então nunca
-   correm o risco de ter conteúdo apagado.
+Páginas com menos de `_OCR_MIN_CHARS` caracteres nativos são reconhecidas
+com Tesseract via `get_textpage_ocr`, a `_OCR_DPI`. O texto OCR conserva as
+coordenadas; linhas sobrepostas a figuras são removidas do corpo e, quando
+reconhecidas, ficam num callout recolhido junto ao embed. Páginas que já têm
+texto nativo não passam por OCR de página inteira.
+
+`pymupdf4llm.use_layout(False)` continua desativando o classificador ONNX
+porque o pipeline de legislação ainda pode usar a extração compartilhada.
 """
 
 import datetime
@@ -45,6 +39,11 @@ import pymupdf
 import pymupdf4llm
 from PIL import Image
 
+if __package__:
+    from . import tabelas
+else:
+    import tabelas
+
 # Desativa o motor de layout/OCR automático baseado em ONNX (ver docstring
 # do módulo). Precisa rodar antes de qualquer chamada de to_markdown().
 pymupdf4llm.use_layout(False)
@@ -52,6 +51,17 @@ pymupdf4llm.use_layout(False)
 # Abaixo deste número de caracteres de texto nativo, consideramos a página
 # "sem texto digital" (provavelmente escaneada) e rodamos OCR manual nela.
 _OCR_MIN_CHARS = 30
+_OCR_DPI = 300
+HEADING_BASE_LEVEL = 4
+_HEADING_MAX_LEVEL = 6
+_LAYOUT_Y_TOLERANCE = 3.0
+_PARAGRAPH_LEFT_TOLERANCE = 4.0
+_PARAGRAPH_LINE_GAP_FACTOR = 1.6
+_PARAGRAPH_RIGHT_EDGE_RATIO = 0.85
+_FIGURE_TEXT_OVERLAP_RATIO = 0.60
+_VECTOR_FIGURE_MIN_AREA_RATIO = 0.025
+_VECTOR_FIGURE_MIN_WIDTH_RATIO = 0.20
+_OCR_HEADING_MIN_HEIGHT = 10.0
 
 # Casa qualquer link de imagem gerado pelo pymupdf4llm, independente do
 # caminho absoluto/relativo que ele tenha usado internamente.
@@ -346,17 +356,27 @@ def _extrair_notas_rodape_pagina(conteudo: str) -> tuple:
 # nenhum conteúdo depois), são só descartados.
 _MARCADOR_ESTRANHO_RE = re.compile(r"(?m)^([ \t]*)(?:`o`|[❖➢⮚➤➥▶►∙•●○▪◦])[ \t]*")
 _MARCADOR_DECORATIVO_FIM_RE = re.compile(r"(?m)[ \t]*[❖➢⮚➤➥▶►](?=[ \t]*$)")
+_MARCADOR_TOPICO_CONVERTIDO = "\ue000"
 
 
 def _normalizar_marcadores_apostila(texto: str) -> str:
-    """Ver docstring da seção acima. Roda sobre o documento inteiro, antes
-    do reflow (pra que os novos "- " já sejam reconhecidos como início de
-    bloco por `reflow_paragraphs_apostila`)."""
+    """Converte marcadores decorativos para um marcador interno rastreável.
+
+    O token interno permite distinguir os hífens criados pelo conversor dos
+    hífens literais do documento durante o reflow.
+    """
     if not texto:
         return texto
     texto = _MARCADOR_DECORATIVO_FIM_RE.sub("", texto)
-    texto = _MARCADOR_ESTRANHO_RE.sub(lambda m: f"{m.group(1)}- ", texto)
+    texto = _MARCADOR_ESTRANHO_RE.sub(
+        lambda m: f"{m.group(1)}{_MARCADOR_TOPICO_CONVERTIDO} ",
+        texto,
+    )
     return texto
+
+
+def _restaurar_marcadores_topico(texto: str) -> str:
+    return texto.replace(_MARCADOR_TOPICO_CONVERTIDO, "-")
 
 
 # --- Reflow com padrões extras de índice/sumário ---------------------------
@@ -369,6 +389,7 @@ def _normalizar_marcadores_apostila(texto: str) -> str:
 # ilegível), ordinal com parênteses ("1ª) Remédio...", "2ª) Da decisão...")
 # e subtítulo de letra ("A) ROC", "A.1) ROC no STF").
 _BLOCK_START_PATTERNS_APOSTILA = _BLOCK_START_PATTERNS + [
+    re.compile(r"^\ue000\s"),               # marcador decorativo convertido, origem preservada
     re.compile(r"^\d{1,3}[ªº]\)\s"),      # "1ª) ", "2ª) "
     re.compile(r"^\d{1,3}[-–—]\s+\S"),  # "1- Teoria Geral", "2- Ações"
     re.compile(r"^[A-Z]\)\s"),             # "A) ROC", "B) ..."
@@ -468,13 +489,20 @@ def reflow_paragraphs_apostila(md_text: str) -> str:
 _IMG_LINE_RE = re.compile(r"^!\[\]\(.+\.(?:png|jpe?g|webp)\)")
 
 
-def _ancoras_de_imagem_por_pagina(doc: "pymupdf.Document") -> dict:
+def _ancoras_de_imagem_por_pagina(
+    doc: "pymupdf.Document",
+    blocos_ocr_por_pagina: dict = None,
+) -> dict:
     """Ver docstring da seção acima. Devolve `{pagina_0indexada: [texto_ou_None, ...]}`
     -- uma entrada por imagem da página, na mesma ordem (topo -> baixo)
-    em que o pymupdf4llm extrai as imagens dessa página."""
+    em que o pymupdf4llm extrai as imagens dessa página. Se a página não tiver
+    texto nativo, usa os blocos de OCR já extraídos para ancorar as imagens."""
     resultado = {}
+    blocos_ocr_por_pagina = blocos_ocr_por_pagina or {}
     for page in doc:
         blocks = page.get_text("dict").get("blocks", [])
+        if not any(block.get("type") == 0 for block in blocks):
+            blocks.extend(blocos_ocr_por_pagina.get(page.number, []))
         blocks = sorted(blocks, key=lambda b: (round(b["bbox"][1], 1), round(b["bbox"][0], 1)))
         ancoras = []
         texto_anterior = None
@@ -504,7 +532,7 @@ def _normalizar_para_match(texto: str) -> str:
     trocado por "-"; sem remover os dois lados, a âncora nunca bate),
     espaços colapsados."""
     texto = texto.lower()
-    texto = re.sub(r"[*_`~\"“”‘’<>–—\-❖➢⮚➤➥▶►∙•●○▪◦]", " ", texto)
+    texto = re.sub(r"[*_`~\"“”‘’<>–—\-❖➢⮚➤➥▶►∙•●○▪◦\ue000]", " ", texto)
     texto = re.sub(r"\s+", " ", texto).strip()
     return texto
 
@@ -600,7 +628,7 @@ def process_pages_apostila(md_text: str, ancoras_por_pagina: dict = None) -> tup
                 rf"\[\^{re.escape(numero_original)}\]", f"[^{global_id}]", conteudo
             )
             notas_globais.append((global_id, corpo))
-        return conteudo
+        return _restaurar_marcadores_topico(conteudo)
 
     for i in range(0, len(partes) - 1, 2):
         conteudo = partes[i]
@@ -676,7 +704,9 @@ def _formatar_item_indice(texto: str, nivel: int = 0) -> str:
     texto = re.sub(r"^#{1,6}\s*", "", texto).strip()
     if not texto:
         return ""
-    nivel_heading = 3 + min(max(nivel, 0), 3)
+    nivel_heading = HEADING_BASE_LEVEL + min(
+        max(nivel, 0), _HEADING_MAX_LEVEL - HEADING_BASE_LEVEL
+    )
     return f"{'#' * nivel_heading} {texto}"
 
 
@@ -1023,6 +1053,9 @@ def _normalizar_simbolos_logicos(md_text: str) -> str:
     for linha in md_text.splitlines(keepends=True):
         conteudo = linha.rstrip("\r\n")
         terminador = linha[len(conteudo):]
+        if conteudo.lstrip().startswith("|"):
+            saida.append(conteudo + terminador)
+            continue
         tachados = []
 
         def _proteger_tachado(match: re.Match) -> str:
@@ -1111,6 +1144,8 @@ def _remover_sites_residuais(texto: str) -> str:
     ocorrencias = {}
     pagina_atual = 0
     for linha in linhas:
+        if linha.lstrip().startswith("|"):
+            continue
         if re.fullmatch(r"\*p\. \d+\*", linha.strip()):
             pagina_atual += 1
         for match in _SITE_TOKEN_RE.finditer(linha):
@@ -1119,6 +1154,9 @@ def _remover_sites_residuais(texto: str) -> str:
 
     resultado = []
     for linha in linhas:
+        if linha.lstrip().startswith("|"):
+            resultado.append(linha)
+            continue
         if _SITE_ONLY_LINE_RE.fullmatch(linha):
             continue
         estado = {"remover_numero_pagina": False}
@@ -1208,9 +1246,12 @@ def _limpar_ocr_site(texto: str) -> str:
     for linha in texto.splitlines():
         if _SITE_ONLY_LINE_RE.fullmatch(linha.strip()):
             continue
-        if re.fullmatch(r"(?i)\s*(?:[A-Z0-9]{1,4}\s+)?JUR[ií]DICO\s*", linha):
+        if re.fullmatch(r"(?i)\s*(?:G\s*7\s*)?JUR[ií]DICO\s*", linha):
             continue
-        limpa = _SITE_TOKEN_RE.sub("", linha).strip()
+        limpa = re.sub(
+            r"(?i)\bG\s*7\s*JUR[ií]DICO\b", "", linha
+        )
+        limpa = _SITE_TOKEN_RE.sub("", limpa).strip()
         if limpa:
             linhas.append(limpa)
     return "\n".join(linhas)
@@ -1256,86 +1297,815 @@ def _extrair_layout_pdf(
     img_dir: str,
     stem: str,
     crop_watermark: bool = False,
+    derecho_profile: bool = False,
 ) -> tuple:
-    """Extrai texto e imagens por posição; tiras adjacentes viram uma figura."""
-    paginas = []
+    """Extrai todas as páginas por geometria, sem depender da ordem do Markdown."""
+    os.makedirs(img_dir, exist_ok=True)
     with pymupdf.open(input_path) as doc:
-        for page in doc:
-            page_dict = page.get_text("dict")
-            blocos = page_dict.get("blocks", [])
-            imagens = sorted(
-                (block for block in blocos if block.get("type") == 1 and block.get("image")),
-                key=lambda block: (block["bbox"][1], block["bbox"][0]),
-            )
-            grupos = []
-            for block in imagens:
-                bbox = block["bbox"]
-                if grupos:
-                    anterior = grupos[-1][-1]["bbox"]
-                    mesma_largura = abs((anterior[2] - anterior[0]) - (bbox[2] - bbox[0])) <= 1
-                    mesma_coluna = abs(anterior[0] - bbox[0]) <= 1
-                    adjacente = abs(anterior[3] - bbox[1]) <= 3
-                    if mesma_largura and mesma_coluna and adjacente:
-                        grupos[-1].append(block)
-                        continue
-                grupos.append([block])
+        page_data = []
+        all_lines = []
+        footer_numbers = []
 
-            eventos = []
-            titulo_state = {"nivel": None}
-            for block in blocos:
+        for page in doc:
+            native = page.get_text("dict")
+            native_text = "".join(
+                span.get("text", "")
+                for block in native.get("blocks", [])
+                if block.get("type") == 0
+                for line in block.get("lines", [])
+                for span in line.get("spans", [])
+            )
+            text_page = None
+            page_dict = native
+            if len(native_text.strip()) < _OCR_MIN_CHARS:
+                try:
+                    text_page = page.get_textpage_ocr(
+                        full=True, language="por+eng", dpi=_OCR_DPI
+                    )
+                except Exception as exc:  # noqa: BLE001 - report actionable OCR setup failures
+                    if "Tesseract is not installed" in str(exc):
+                        raise RuntimeError(
+                            "OCR é necessário para páginas sem texto extraível, mas o "
+                            "Tesseract não está instalado. A conversão foi interrompida."
+                        ) from exc
+                    raise RuntimeError(
+                        f"Falha no OCR da página {page.number + 1}: {exc}"
+                    ) from exc
+                ocr_dict = page.get_text("dict", textpage=text_page)
+                page_dict = {
+                    "blocks": [
+                        block for block in native.get("blocks", [])
+                        if block.get("type") == 1
+                    ] + [
+                        block for block in ocr_dict.get("blocks", [])
+                        if block.get("type") == 0
+                    ]
+                }
+
+            images = [
+                block for block in page_dict.get("blocks", [])
+                if block.get("type") == 1 and block.get("image")
+            ]
+            image_groups = _agrupar_blocos_imagem(images)
+            figures = [
+                {
+                    "bbox": (
+                        min(block["bbox"][0] for block in group),
+                        min(block["bbox"][1] for block in group),
+                        max(block["bbox"][2] for block in group),
+                        max(block["bbox"][3] for block in group),
+                    ),
+                    "kind": "raster",
+                    "blocks": group,
+                }
+                for group in image_groups
+            ]
+            tables = _extrair_tabelas_nativas(page, text_page is None)
+            figures.extend(_figuras_vetoriais_da_pagina(page, figures))
+            figures = [
+                figure for figure in figures
+                if not any(
+                    _bbox_overlap_ratio(figure["bbox"], table["bbox"]) >= 0.60
+                    for table in tables
+                )
+            ]
+
+            lines = []
+            for block in page_dict.get("blocks", []):
                 if block.get("type") != 0:
                     continue
                 for line in block.get("lines", []):
-                    bbox = line.get("bbox", block.get("bbox", (0, 0, 0, 0)))
-                    if bbox[1] >= page.rect.height * 0.93:
+                    info = _informacao_linha_pdf(line, page.rect)
+                    if not info["text"] or info["bbox"][2] - info["bbox"][0] <= 2:
                         continue
-                    text = _texto_linha_pdf(line, titulo_state)
-                    if text:
-                        eventos.append((bbox[1], bbox[0], "texto", text))
+                    info["page"] = page.number
+                    info["native"] = text_page is None
+                    lines.append(info)
 
-            for indice, grupo in enumerate(grupos, start=1):
-                partes = [Image.open(io.BytesIO(block["image"])).convert("RGB") for block in grupo]
-                largura = max(parte.width for parte in partes)
-                partes = [
-                    parte.resize((largura, max(1, round(parte.height * largura / parte.width))))
-                    if parte.width != largura else parte
-                    for parte in partes
+            lines = _combinar_fragmentos_numericos(lines)
+            page_data.append(
+                {
+                    "page": page,
+                    "lines": lines,
+                    "figures": figures,
+                    "tables": tables,
+                    "ocr_used": text_page is not None,
+                }
+            )
+            all_lines.extend(lines)
+
+        table_groups = tabelas.unir_tabelas_entre_paginas(
+            [data["tables"] for data in page_data]
+        )
+        table_image_count = 0
+        for data in page_data:
+            data["render_tables"] = []
+        for table_number, table_group in enumerate(table_groups, start=1):
+            compact_right_table = derecho_profile and any(
+                len(part["rows"]) <= 3 and part["column_count"] >= 4
+                for part in table_group["parts"]
+            )
+            if compact_right_table:
+                table_group["fallback_image"] = True
+            if table_group["fallback_image"]:
+                table_group["markdown"] = _renderizar_grupo_tabela_como_imagem(
+                    table_group, page_data, img_dir, stem, table_number
+                )
+                table_image_count += len(table_group["parts"])
+            page_data[table_group["render_page"]]["render_tables"].append(
+                table_group
+            )
+
+        repeated_headers = _cabecalhos_corridos_repetidos(page_data)
+        for data in page_data:
+            page = data["page"]
+            body_lines = []
+            footer_text = []
+            for line in data["lines"]:
+                if line["bbox"][1] >= page.rect.height * 0.93:
+                    footer_text.append(line["text"])
+                elif (
+                    line["bbox"][1] <= page.rect.height * 0.08
+                    and _normalizar_linha_corrida(line["text"]) in repeated_headers
+                ):
+                    continue
+                elif any(
+                    _bbox_overlap_ratio(line["bbox"], table["bbox"])
+                    >= _FIGURE_TEXT_OVERLAP_RATIO
+                    for table in data["tables"]
+                ):
+                    continue
+                else:
+                    body_lines.append(line)
+            footer_digits = [
+                int(value)
+                for text in footer_text
+                for value in re.findall(r"(?<!\w)\d{1,3}(?!\w)", text)
+            ]
+            footer_numbers.append(footer_digits[-1] if footer_digits else None)
+            data["lines"] = body_lines
+
+        use_printed_pages = (
+            all(number is not None for number in footer_numbers)
+            and all(
+                current > previous
+                for previous, current in zip(footer_numbers, footer_numbers[1:])
+            )
+        )
+
+        heading_lines = [
+            line
+            for data in page_data
+            for line in data["lines"]
+            if not any(
+                _bbox_overlap_ratio(line["bbox"], figure["bbox"])
+                >= _FIGURE_TEXT_OVERLAP_RATIO
+                for figure in data["figures"]
+            ) and not any(
+                _bbox_overlap_ratio(line["bbox"], table["bbox"])
+                >= _FIGURE_TEXT_OVERLAP_RATIO
+                for table in data["tables"]
+            )
+        ]
+        heading_styles, median_heading_size = _rank_heading_styles(heading_lines)
+        image_index = 0
+        rendered_pages = []
+        for data in page_data:
+            page = data["page"]
+            page_number = page.number + 1
+            lines = data["lines"]
+            figures = data["figures"]
+            in_summary = False
+
+            visible_lines = []
+            for line in lines:
+                contained = [
+                    figure for figure in figures
+                    if _bbox_overlap_ratio(line["bbox"], figure["bbox"])
+                    >= _FIGURE_TEXT_OVERLAP_RATIO
                 ]
-                figura = Image.new("RGB", (largura, sum(parte.height for parte in partes)), "white")
-                y = 0
-                for parte in partes:
-                    figura.paste(parte, (0, y))
-                    y += parte.height
+                if contained:
+                    line["figure"] = contained[0]
+                else:
+                    visible_lines.append(line)
 
-                ocr = _ocr_figura(figura)
-                if crop_watermark and re.search(r"(?i)(?:www|jur[ií]dico|\.com\.?br)", ocr):
-                    figura = figura.crop((0, 0, max(1, int(figura.width * 0.94)), max(1, int(figura.height * 0.94))))
+            list_x_positions = [
+                line["bbox"][0] for line in visible_lines if line.get("list_marker")
+            ]
+            list_origin = min(list_x_positions, default=0.0)
+            events = [
+                {
+                    "y": line["bbox"][1],
+                    "x": line["bbox"][0],
+                    "kind": "text",
+                    "line": line,
+                }
+                for line in visible_lines
+            ]
+            events.extend(
+                {
+                    "y": figure["bbox"][1],
+                    "x": figure["bbox"][0],
+                    "kind": "figure",
+                    "figure": figure,
+                }
+                for figure in figures
+            )
+            events.extend(
+                {
+                    "y": table["render_y"],
+                    "x": table["parts"][-1]["bbox"][0],
+                    "kind": "table",
+                    "table": table,
+                }
+                for table in data["render_tables"]
+            )
+            events = _ordenar_eventos_geometricos(events)
+            blocks = []
+            current_lines = []
 
-                page_number = page.number + 1
-                filename = f"{stem}-pg{page_number}-fig{indice}.png"
-                figura.save(os.path.join(img_dir, filename), format="PNG")
-                figure_block = f"![[{filename}]]"
-                ocr = _limpar_ocr_site(ocr)
-                ocr = _normalizar_simbolos_logicos(ocr).strip()
-                if len(ocr) >= 4:
-                    ocr_block = "> [!note]- Texto OCR (aproximado)\n" + "\n".join(
-                        f"> {line}" for line in ocr.splitlines() if line.strip()
+            def flush_paragraph() -> None:
+                if current_lines:
+                    blocks.append(_juntar_linhas_geometricamente(current_lines))
+                    current_lines.clear()
+
+            for event in events:
+                if event["kind"] == "figure":
+                    flush_paragraph()
+                    figure = event["figure"]
+                    image_index += 1
+                    filename = f"{stem}-img{image_index}-pg{page_number}.png"
+                    figure_text = [
+                        line["text"]
+                        for line in lines
+                        if line.get("figure") is figure
+                    ]
+                    ocr_text = _salvar_figura_posicional(
+                        page, figure, filename, img_dir, crop_watermark,
+                        "\n".join(figure_text),
+                        data["ocr_used"],
                     )
-                    figure_block += "\n\n" + ocr_block
-                bbox = grupo[0]["bbox"]
-                eventos.append((bbox[1], bbox[0], "imagem", figure_block))
+                    embed = f"![[{filename}]]"
+                    ocr_text = _limpar_ocr_site(ocr_text)
+                    if len(re.sub(r"\s+", "", ocr_text)) >= 4:
+                        callout = "> [!note]- Texto OCR (aproximado)\n" + "\n".join(
+                            f"> {line.strip()}"
+                            for line in ocr_text.splitlines()
+                            if line.strip()
+                        )
+                        embed += "\n\n" + callout
+                    blocks.append(embed)
+                    continue
+                if event["kind"] == "table":
+                    flush_paragraph()
+                    blocks.append(event["table"]["markdown"])
+                    continue
 
-            eventos.sort(key=lambda evento: (evento[0], evento[1]))
-            pagina_texto = "\n\n".join(evento[3] for evento in eventos)
-            paginas.append(pagina_texto)
+                line = event["line"]
+                text = re.sub(r"\s+", " ", line["text"]).strip()
+                is_summary_title = text.casefold() == "sumário"
+                is_summary_item = in_summary and bool(_OUTLINE_RE.match(text))
+                if is_summary_title:
+                    in_summary = True
+                elif in_summary and not is_summary_item:
+                    in_summary = False
+                heading_level = (
+                    None
+                    if is_summary_item
+                    else _nivel_heading_posicional(
+                        line, heading_styles, median_heading_size
+                    )
+                )
+                if heading_level is not None:
+                    flush_paragraph()
+                    heading_text = _formatar_linha_posicional(line, list_origin)
+                    heading_text = re.sub(r"\*\*(.*?)\*\*", r"\1", heading_text)
+                    heading_text = re.sub(r"(?<!\*)\*(?!\*)(.*?)\*(?!\*)", r"\1", heading_text)
+                    blocks.append(f"{'#' * heading_level} {heading_text.strip()}")
+                    continue
 
-    md = []
-    for indice, conteudo in enumerate(paginas):
-        if conteudo.strip():
-            md.append(conteudo)
-        if indice < len(paginas) - 1:
-            md.append(f"\n\n---\n*p. {indice + 1}*\n\n---\n\n")
-    return "".join(md), sum(1 for page in paginas for _ in re.finditer(r"!\[\[", page))
+                formatted = _formatar_linha_posicional(line, list_origin)
+                if not current_lines or not _linhas_formam_paragrafo(
+                    current_lines[-1], line, page.rect.width
+                ):
+                    flush_paragraph()
+                current_lines.append({**line, "formatted": formatted})
+
+            flush_paragraph()
+            content = "\n\n".join(block for block in blocks if block.strip())
+            content = re.sub(r"(?m)^--- end of page=\d+ ---\s*$", "", content)
+            printed_page = (
+                footer_numbers[page.number]
+                if use_printed_pages else page_number
+            )
+            rendered_pages.append(
+                f"{content}\n\n---\n*p. {printed_page}*\n\n---\n\n"
+            )
+
+    return "".join(rendered_pages), image_index + table_image_count
+
+
+def _extrair_tabelas_nativas(page, has_native_text: bool) -> list:
+    if not has_native_text:
+        return []
+    return tabelas.extrair_tabelas_pagina(page)
+
+
+def _renderizar_grupo_tabela_como_imagem(
+    table_group: dict,
+    page_data: list[dict],
+    img_dir: str,
+    stem: str,
+    table_number: int,
+) -> str:
+    links = []
+    for part in table_group["parts"]:
+        page_index = part["page_index"]
+        page = page_data[page_index]["page"]
+        rect = pymupdf.Rect(part["bbox"])
+        rect.x0 = max(page.rect.x0, rect.x0 - 3)
+        rect.y0 = max(page.rect.y0, rect.y0 - 3)
+        rect.x1 = min(page.rect.x1, rect.x1 + 3)
+        rect.y1 = min(page.rect.y1, rect.y1 + 3)
+        filename = f"{stem}-table{table_number}-pg{page_index + 1}.png"
+        page.get_pixmap(
+            matrix=pymupdf.Matrix(
+                tabelas.TABLE_RENDER_DPI_SCALE,
+                tabelas.TABLE_RENDER_DPI_SCALE,
+            ),
+            clip=rect,
+            alpha=False,
+        ).save(os.path.join(img_dir, filename))
+        links.append(f"![[{filename}]]")
+
+    quoted_text = "\n".join(
+        f"> {line}" if line else ">"
+        for line in table_group["fallback_text"].splitlines()
+    )
+    return "\n\n".join(links) + "\n\n> [!note]- Texto da tabela\n" + quoted_text
+
+
+def _informacao_linha_pdf(line: dict, page_rect) -> dict:
+    spans = [span for span in line.get("spans", []) if span.get("text", "").strip()]
+    bbox = tuple(line.get("bbox", (0, 0, 0, 0)))
+    sizes = [float(span.get("size", 0)) for span in spans if span.get("size")]
+    size = max(sizes, default=max(1.0, bbox[3] - bbox[1]))
+    text = _texto_spans_geometricamente(spans, size)
+    bold_spans = [bool(span.get("flags", 0) & 16) for span in spans]
+    bold = bool(bold_spans) and all(bold_spans)
+    italic = bool(bold_spans) and all(span.get("flags", 0) & 2 for span in spans)
+    center = (bbox[0] + bbox[2]) / 2
+    centered = abs(center - page_rect.width / 2) <= page_rect.width * 0.03
+    list_marker, list_text_x = _detectar_marcador_posicional(spans, text, bbox)
+    return {
+        "bbox": bbox,
+        "page_width": page_rect.width,
+        "page_height": page_rect.height,
+        "text": text,
+        "size": size,
+        "height": max(1.0, bbox[3] - bbox[1]),
+        "bold": bold,
+        "any_bold": any(bold_spans),
+        "italic": italic,
+        "centered": centered,
+        "list_marker": list_marker,
+        "list_text_x": list_text_x,
+        "spans": spans,
+    }
+
+
+def _texto_spans_geometricamente(spans: list, size: float) -> str:
+    text = []
+    previous_span = None
+    for span in spans:
+        value = span.get("text", "")
+        if not value:
+            continue
+        if previous_span is not None:
+            previous_bbox = previous_span.get("bbox", (0, 0, 0, 0))
+            current_bbox = span.get("bbox", (0, 0, 0, 0))
+            gap = current_bbox[0] - previous_bbox[2]
+            if (
+                gap > max(0.5, size * 0.06)
+                and text
+                and not text[-1].endswith((" ", "\t"))
+                and not value.startswith((" ", "\t"))
+            ):
+                text.append(" ")
+        text.append(value)
+        previous_span = span
+    return "".join(text).strip()
+
+
+def _combinar_fragmentos_numericos(lines: list) -> list:
+    ordered = sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0]))
+    combined = []
+    index = 0
+    while index < len(ordered):
+        line = ordered[index]
+        if (
+            re.fullmatch(r"\d{1,3}[.)]", line["text"])
+            and index + 1 < len(ordered)
+        ):
+            following = ordered[index + 1]
+            same_baseline = abs(line["bbox"][1] - following["bbox"][1]) <= 2.0
+            horizontal_gap = following["bbox"][0] - line["bbox"][2]
+            if same_baseline and 0 <= horizontal_gap <= 24:
+                combined.append({
+                    **following,
+                    "text": f"{line['text']} {following['text']}",
+                    "bbox": (
+                        line["bbox"][0],
+                        min(line["bbox"][1], following["bbox"][1]),
+                        following["bbox"][2],
+                        max(line["bbox"][3], following["bbox"][3]),
+                    ),
+                    "spans": line["spans"] + following["spans"],
+                })
+                index += 2
+                continue
+        combined.append(line)
+        index += 1
+    return combined
+
+
+_POSITIONAL_BULLET_RE = re.compile(
+    r"^[ \t]*(?P<marker>▪|❖|➢|✓|●|○|•|◦|=|\*\s*\||\*|\+|QO\))"
+    r"(?:[ \t]+|$)(?P<text>\S.*)$",
+    re.IGNORECASE,
+)
+
+
+def _detectar_marcador_posicional(spans: list, text: str, bbox: tuple) -> tuple:
+    visible = [span for span in spans if span.get("text", "").strip()]
+    if len(visible) >= 2:
+        marker = visible[0].get("text", "").strip()
+        following = visible[1].get("text", "").strip()
+        gap = visible[1].get("bbox", (0, 0, 0, 0))[0] - visible[0].get(
+            "bbox", (0, 0, 0, 0)
+        )[2]
+        font = str(visible[0].get("font", "")).casefold()
+        is_courier_o = marker.casefold() == "o" and "courier" in font
+        recognized = marker in {"▪", "❖", "➢", "✓", "●", "○", "•", "◦", "=", "*", "+"}
+        if len(marker) <= 3 and gap >= 6 and following and (recognized or is_courier_o):
+            return marker, visible[1]["bbox"][0]
+    if re.match(r"^o\s+\S", text) and any(
+        "courier" in str(span.get("font", "")).casefold() for span in visible
+    ):
+        first = visible[0].get("bbox", bbox)
+        return "o", first[0] + 18
+    match = _POSITIONAL_BULLET_RE.match(text)
+    if match:
+        marker = match.group("marker")
+        return marker, bbox[0] + 18
+    return None, None
+
+
+def _bbox_overlap_ratio(inner: tuple, outer: tuple) -> float:
+    x0 = max(inner[0], outer[0])
+    y0 = max(inner[1], outer[1])
+    x1 = min(inner[2], outer[2])
+    y1 = min(inner[3], outer[3])
+    intersection = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    area = max(0.0, inner[2] - inner[0]) * max(0.0, inner[3] - inner[1])
+    return intersection / area if area else 0.0
+
+
+def _normalizar_linha_corrida(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", text.casefold())
+
+
+def _cabecalhos_corridos_repetidos(page_data: list) -> set:
+    por_texto = {}
+    for data in page_data:
+        page = data["page"]
+        vistos = set()
+        for line in data["lines"]:
+            if line["bbox"][1] > page.rect.height * 0.08:
+                continue
+            normalizado = _normalizar_linha_corrida(line["text"])
+            if len(normalizado) >= 4:
+                vistos.add(normalizado)
+        for text in vistos:
+            por_texto[text] = por_texto.get(text, 0) + 1
+    return {text for text, count in por_texto.items() if count >= 3}
+
+
+def _figuras_vetoriais_da_pagina(page, raster_figures: list) -> list:
+    figures = []
+    drawings = page.get_drawings()
+    page_area = page.rect.get_area()
+    figure_drawings = []
+    for drawing in drawings:
+        rect = pymupdf.Rect(drawing["rect"])
+        area = rect.get_area()
+        fill = drawing.get("fill")
+        colored_fill = (
+            fill is not None
+            and min(fill[:3]) < 0.96
+            and max(fill[:3]) - min(fill[:3]) >= 0.08
+        )
+        large_frame = (
+            area >= page_area * _VECTOR_FIGURE_MIN_AREA_RATIO
+            and area < page_area * 0.50
+            and any(item and item[0] == "re" for item in drawing.get("items", []))
+        )
+        if area < page_area * 0.50 and (colored_fill or large_frame):
+            figure_drawings.append(drawing)
+    if not figure_drawings:
+        return figures
+
+    for cluster in page.cluster_drawings(
+        drawings=figure_drawings,
+        x_tolerance=_LAYOUT_Y_TOLERANCE,
+        y_tolerance=_LAYOUT_Y_TOLERANCE,
+    ):
+        rect = pymupdf.Rect(cluster)
+        area = rect.get_area()
+        if (
+            not area
+            or area < page_area * _VECTOR_FIGURE_MIN_AREA_RATIO
+            or rect.width < page.rect.width * _VECTOR_FIGURE_MIN_WIDTH_RATIO
+        ):
+            continue
+        rect_tuple = tuple(rect)
+        if any(_bbox_overlap_ratio(rect_tuple, image["bbox"]) >= 0.25 for image in raster_figures):
+            continue
+        if any(_bbox_overlap_ratio(rect_tuple, other["bbox"]) >= 0.80 for other in figures):
+            continue
+        figures.append({"bbox": rect_tuple, "kind": "vector", "blocks": []})
+    return figures
+
+
+def _rank_heading_styles(all_lines: list) -> tuple:
+    sizes = sorted(line["size"] for line in all_lines if line["text"].strip())
+    median_size = sizes[len(sizes) // 2] if sizes else 0
+    candidates = [
+        line for line in all_lines
+        if _es_titulo_posicional(line, median_size)
+    ]
+    styles = {
+        _heading_style_key(line): line
+        for line in candidates
+    }
+    ranked = sorted(
+        styles,
+        key=lambda key: (-key[0], -int(key[1]), -int(key[2])),
+    )
+    return (
+        {
+            key: HEADING_BASE_LEVEL + min(
+                index, _HEADING_MAX_LEVEL - HEADING_BASE_LEVEL
+            )
+            for index, key in enumerate(ranked)
+        },
+        median_size,
+    )
+
+
+def _heading_style_key(line: dict) -> tuple:
+    return (round(line["size"] * 2) / 2, line["bold"], line["centered"])
+
+
+_NUMERIC_HEADING_RE = re.compile(
+    r"^(?P<number>\d+(?:\.\d+)*)(?:\.(?=\s)|\s*[-–—)]\s*|\s+)(?P<title>\S.*)$"
+)
+_LETTER_HEADING_RE = re.compile(
+    r"^(?P<number>[A-Z](?:\.\d+)?)\)\s+(?P<title>\S.*)$"
+)
+
+
+def _es_titulo_posicional(line: dict, median_size: float) -> bool:
+    text = re.sub(r"\s+", " ", line["text"]).strip()
+    if (
+        len(text) < 3
+        or len(text) > 120
+        or re.search(r"[.!?:;]$", text)
+        or re.search(r"[.!?]\s+\w{1,3}$", text)
+    ):
+        return False
+    if re.fullmatch(r"(?i)bloco\s+\d+", text):
+        return True
+    if _NUMERIC_HEADING_RE.match(text):
+        if len(text) > 85:
+            return False
+        return line["bold"] or text.isupper() or line["size"] >= median_size * 1.12
+    if _LETTER_HEADING_RE.match(text):
+        return line["bold"] or text.isupper() or line["size"] >= median_size * 1.12
+    if line["any_bold"] and line["bold"]:
+        return True
+    if line.get("page") != 0 and text.isupper() and len(text) <= 60:
+        return (
+            line.get("centered", False)
+            or line["size"] >= median_size * 1.08
+            or line["height"] >= max(_OCR_HEADING_MIN_HEIGHT, median_size * 1.08)
+        )
+    return bool(
+        line.get("page") != 0
+        and text.isupper()
+        and line["centered"]
+        and (
+            line["size"] >= median_size * 1.08
+            or line["height"] >= max(_OCR_HEADING_MIN_HEIGHT, median_size * 1.08)
+        )
+    )
+
+
+def _nivel_heading_posicional(
+    line: dict, heading_styles: dict, median_size: float
+):
+    text = re.sub(r"\s+", " ", line["text"]).strip()
+    if text.casefold() in {"sumário", "roteiro de aula"}:
+        return HEADING_BASE_LEVEL
+    if (
+        text.isupper()
+        and len(text) >= 12
+        and line["bbox"][1] <= line.get("page_height", 0) * 0.18
+        and line["bbox"][2] - line["bbox"][0] <= line.get("page_width", 0) * 0.85
+    ):
+        return HEADING_BASE_LEVEL
+    if not _es_titulo_posicional(line, median_size):
+        return None
+    if re.fullmatch(r"(?i)bloco\s+\d+", text):
+        return HEADING_BASE_LEVEL
+    numeric = _NUMERIC_HEADING_RE.match(text)
+    if numeric:
+        depth = numeric.group("number").count(".")
+        return min(HEADING_BASE_LEVEL + depth, _HEADING_MAX_LEVEL)
+    letter = _LETTER_HEADING_RE.match(text)
+    if letter:
+        return min(
+            HEADING_BASE_LEVEL + letter.group("number").count("."),
+            _HEADING_MAX_LEVEL,
+        )
+    if (
+        text.isupper()
+        and len(text) <= 60
+        and len(text) >= 8
+        and line.get("page") != 0
+        and (
+            line.get("centered", False)
+            or line["size"] >= median_size * 1.08
+            or line["height"] >= max(_OCR_HEADING_MIN_HEIGHT, median_size * 1.08)
+        )
+    ):
+        return HEADING_BASE_LEVEL
+    return HEADING_BASE_LEVEL
+
+
+def _formatar_linha_posicional(line: dict, list_origin: float) -> str:
+    text = line["text"].strip()
+    if line.get("list_marker"):
+        level = min(max(round((line["bbox"][0] - list_origin) / 18), 0), 5)
+        indent = "  " * level
+        text = re.sub(
+            r"^[ \t]*(?:▪|❖|➢|✓|●|○|•|◦|=|\*\s*\||\*|\+|QO\)|o)[ \t]*",
+            "",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if text == line["text"].strip():
+            text = re.sub(r"^\S+\s*", "", text, count=1)
+        return f"{indent}- {text}".rstrip()
+    if line["spans"]:
+        formatted = []
+        previous_span = None
+        for span in line["spans"]:
+            value = span.get("text", "")
+            if not value:
+                continue
+            if previous_span is not None:
+                previous_bbox = previous_span.get("bbox", (0, 0, 0, 0))
+                current_bbox = span.get("bbox", (0, 0, 0, 0))
+                gap = current_bbox[0] - previous_bbox[2]
+                if (
+                    gap > max(0.5, line["size"] * 0.06)
+                    and formatted
+                    and not formatted[-1].endswith((" ", "\t"))
+                    and not value.startswith((" ", "\t"))
+                ):
+                    formatted.append(" ")
+            flags = span.get("flags", 0)
+            if flags & 1 and value.strip().isdigit():
+                value = f"[^{value.strip()}]"
+            else:
+                if flags & 16:
+                    value = f"**{value}**"
+                if flags & 2:
+                    value = f"*{value}*"
+            formatted.append(value)
+            previous_span = span
+        text = "".join(formatted).strip()
+    text = _POSITIONAL_BULLET_RE.sub(
+        lambda match: f"- {match.group('text')}", text, count=1
+    )
+    text = re.sub(
+        r"(?m)^(?:Il|IIl|lll|III)(?=\s*[-–—]\s)",
+        lambda match: "II" if match.group(0) == "Il" else "III",
+        text,
+    )
+    return text
+
+
+def _ordenar_eventos_geometricos(events: list) -> list:
+    events.sort(key=lambda event: (event["y"], event["x"]))
+    rows = []
+    for event in events:
+        if rows and event["y"] <= rows[-1]["anchor"] + _LAYOUT_Y_TOLERANCE:
+            rows[-1]["events"].append(event)
+        else:
+            rows.append({"anchor": event["y"], "events": [event]})
+    return [
+        event
+        for row in rows
+        for event in sorted(row["events"], key=lambda item: item["x"])
+    ]
+
+
+def _linhas_formam_paragrafo(previous: dict, current: dict, page_width: float) -> bool:
+    if current.get("list_marker"):
+        return False
+    if _es_titulo_posicional(previous, 0) or _es_titulo_posicional(current, 0):
+        return False
+    if _heading_style_key(previous) != _heading_style_key(current):
+        return False
+    expected_left = (
+        previous["list_text_x"]
+        if previous.get("list_marker") and previous.get("list_text_x") is not None
+        else previous["bbox"][0]
+    )
+    if abs(expected_left - current["bbox"][0]) > _PARAGRAPH_LEFT_TOLERANCE:
+        return False
+    gap = current["bbox"][1] - previous["bbox"][3]
+    if gap > _PARAGRAPH_LINE_GAP_FACTOR * previous["height"]:
+        return False
+    if previous["bbox"][2] < page_width * _PARAGRAPH_RIGHT_EDGE_RATIO:
+        return False
+    return not re.search(r"[.!?:]$", previous["text"].strip())
+
+
+def _juntar_linhas_geometricamente(lines: list) -> str:
+    if not lines:
+        return ""
+    result = [lines[0]["formatted"]]
+    for line in lines[1:]:
+        previous = result[-1]
+        current = line["formatted"]
+        if previous.endswith("-") and not previous.endswith("--"):
+            result[-1] = previous[:-1] + current.lstrip()
+        else:
+            result.append(current.strip())
+    return " ".join(part for part in result if part)
+
+
+def _salvar_figura_posicional(
+    page,
+    figure: dict,
+    filename: str,
+    img_dir: str,
+    crop_watermark: bool,
+    ocr_text: str,
+    page_ocr_used: bool,
+) -> str:
+    if figure["kind"] == "raster":
+        parts = [
+            Image.open(io.BytesIO(block["image"])).convert("RGB")
+            for block in figure["blocks"]
+        ]
+        width = max(part.width for part in parts)
+        scaled = [
+            part.resize((width, max(1, round(part.height * width / part.width))))
+            if part.width != width else part
+            for part in parts
+        ]
+        image = Image.new("RGB", (width, sum(part.height for part in scaled)), "white")
+        y = 0
+        for part in scaled:
+            image.paste(part, (0, y))
+            y += part.height
+    else:
+        rect = pymupdf.Rect(figure["bbox"])
+        rect.x0 = max(page.rect.x0, rect.x0 - 3)
+        rect.y0 = max(page.rect.y0, rect.y0 - 3)
+        rect.x1 = min(page.rect.x1, rect.x1 + 3)
+        rect.y1 = min(page.rect.y1, rect.y1 + 3)
+        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), clip=rect, alpha=False)
+        image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+
+    watermark_text = ocr_text
+    figure_ocr = ""
+    if not page_ocr_used and len(re.sub(r"\s+", "", watermark_text)) < 4:
+        figure_ocr = _ocr_figura(image)
+        watermark_text = watermark_text or figure_ocr
+    if crop_watermark and re.search(
+        r"(?i)(?:www|jur[ií]dico|\.com\.?br)", watermark_text
+    ):
+        image = image.crop(
+            (0, 0, max(1, int(image.width * 0.94)), max(1, int(image.height * 0.94)))
+        )
+    image.save(os.path.join(img_dir, filename), format="PNG")
+    return watermark_text
 
 
 # --- Checagem de sanidade: imagem na mesma página do PDF -------------------
@@ -1446,9 +2216,77 @@ def _markdown_table_block_count(content: str) -> int:
     )
 
 
+def _indice_pagina_pdf(partes: list, parte_index: int) -> int:
+    for match in _IMG_LINK_RE.finditer(partes[parte_index]):
+        sufixo = _IMG_SUFFIX_RE.search(os.path.basename(match.group(1)))
+        if sufixo:
+            return int(sufixo.group(1))
+    if parte_index + 1 < len(partes):
+        marcador = re.search(r"\*p\.\s*(\d+)\*", partes[parte_index + 1])
+        if marcador:
+            return max(0, int(marcador.group(1)) - 1)
+    return parte_index // 2
+
+
 def _is_complex_pdf_table(table) -> bool:
-    rows = table.extract()
-    return bool(rows) and len(rows) <= 3 and max(len(row) for row in rows) >= 4
+    return tabelas.is_compact_complex_table(table)
+
+
+def _tabela_colorida_associada_a_imagem(page, table) -> bool:
+    import pymupdf
+
+    rect = pymupdf.Rect(table.bbox)
+    area = rect.get_area()
+    if not area or not _retangulo_tem_fundo_nao_branco(page, rect):
+        return False
+    area_imagens = sum(
+        (rect & pymupdf.Rect(bloco["bbox"])).get_area()
+        for bloco in page.get_text("dict").get("blocks", [])
+        if bloco.get("type") == 1
+    )
+    return min(area_imagens / area, 1.0) >= 0.5
+
+
+def _retangulo_tem_fundo_nao_branco(page, bbox) -> bool:
+    import pymupdf
+
+    pixmap = page.get_pixmap(
+        matrix=pymupdf.Matrix(1, 1),
+        clip=pymupdf.Rect(bbox),
+        colorspace=pymupdf.csRGB,
+        alpha=False,
+    )
+    if not pixmap.width or not pixmap.height:
+        return False
+    amostra = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+    amostra.thumbnail((128, 128))
+    cores = amostra.getcolors(maxcolors=128 * 128)
+    if cores is None:
+        return False
+    total = sum(contagem for contagem, _ in cores)
+    nao_brancos = sum(
+        contagem
+        for contagem, (r, g, b) in cores
+        if (299 * r + 587 * g + 114 * b) // 1000 >= 100
+        and min(r, g, b) < 245
+    )
+    return bool(total) and nao_brancos / total >= 0.12
+
+
+def _agrupar_blocos_imagem(blocos: list) -> list:
+    grupos = []
+    for bloco in sorted(blocos, key=lambda item: (item["bbox"][1], item["bbox"][0])):
+        bbox = bloco["bbox"]
+        if grupos:
+            anterior = grupos[-1][-1]["bbox"]
+            mesma_largura = abs((anterior[2] - anterior[0]) - (bbox[2] - bbox[0])) <= 1
+            mesma_coluna = abs(anterior[0] - bbox[0]) <= 1
+            adjacente = abs(anterior[3] - bbox[1]) <= 3
+            if mesma_largura and mesma_coluna and adjacente:
+                grupos[-1].append(bloco)
+                continue
+        grupos.append([bloco])
+    return grupos
 
 
 def _renderizar_tabelas_como_imagens(
@@ -1463,7 +2301,7 @@ def _renderizar_tabelas_como_imagens(
     partes = _PAGE_NOTE_RE.split(md_text)
     with pymupdf.open(input_path) as doc:
         for parte_index in range(0, len(partes), 2):
-            page_index = parte_index // 2
+            page_index = _indice_pagina_pdf(partes, parte_index)
             if page_index >= len(doc):
                 break
             if _markdown_table_block_count(partes[parte_index]) == 0:
@@ -1474,6 +2312,7 @@ def _renderizar_tabelas_como_imagens(
                     tabela
                     for tabela in page.find_tables().tables
                     if _is_complex_pdf_table(tabela)
+                    or _tabela_colorida_associada_a_imagem(page, tabela)
                 ),
                 key=lambda tabela: (tabela.bbox[1], tabela.bbox[0]),
             )
@@ -1507,10 +2346,73 @@ def _renderizar_tabelas_como_imagens(
     return "".join(partes)
 
 
+def _renderizar_imagens_coloridas_fragmentadas(
+    md_text: str,
+    input_path: str,
+    img_dir: str,
+    image_stem: str,
+) -> str:
+    """Recompõe como um recorte regiões coloridas fragmentadas em várias imagens."""
+    import pymupdf
+
+    partes = _PAGE_NOTE_RE.split(md_text)
+    with pymupdf.open(input_path) as doc:
+        for parte_index in range(0, len(partes), 2):
+            page_index = _indice_pagina_pdf(partes, parte_index)
+            if page_index >= len(doc):
+                break
+            conteudo = partes[parte_index]
+            links = list(_IMG_LINK_RE.finditer(conteudo))
+            if len(links) <= 1:
+                continue
+            page = doc[page_index]
+            blocos = [
+                bloco
+                for bloco in page.get_text("dict").get("blocks", [])
+                if bloco.get("type") == 1
+            ]
+            grupos = _agrupar_blocos_imagem(blocos)
+            if len(grupos) != 1:
+                continue
+            bbox = (
+                min(bloco["bbox"][0] for bloco in grupos[0]),
+                min(bloco["bbox"][1] for bloco in grupos[0]),
+                max(bloco["bbox"][2] for bloco in grupos[0]),
+                max(bloco["bbox"][3] for bloco in grupos[0]),
+            )
+            area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            if (
+                area < page.rect.width * page.rect.height * 0.10
+                or not _retangulo_tem_fundo_nao_branco(page, bbox)
+            ):
+                continue
+
+            rect = pymupdf.Rect(bbox)
+            rect.x0 = max(page.rect.x0, rect.x0 - 3)
+            rect.y0 = max(page.rect.y0, rect.y0 - 3)
+            rect.x1 = min(page.rect.x1, rect.x1 + 3)
+            rect.y1 = min(page.rect.y1, rect.y1 + 3)
+            filename = f"{image_stem}-figure-pg{page_index + 1}.png"
+            page.get_pixmap(
+                matrix=pymupdf.Matrix(2, 2),
+                clip=rect,
+                alpha=False,
+            ).save(os.path.join(img_dir, filename))
+            embed = f"![[{filename}]]"
+            partes[parte_index] = (
+                conteudo[:links[0].start()]
+                + embed
+                + _IMG_LINK_RE.sub("", conteudo[links[0].end():])
+            )
+    return "".join(partes)
+
+
 # Detecta um item de sumário numerado no estilo usado nos slides das aulas:
 # "4. Poder Legislativo", "4.6 Imunidades...", "5- Processo legislativo...",
 # "5.1. Introdução". Testado contra a nota de referência do usuário.
-_OUTLINE_RE = re.compile(r"^\d+(?:[.\-]\d+)*\.?[\s\-]+\S")
+_OUTLINE_RE = re.compile(
+    r"^\d+(?:\.\d+)*(?:\.)?(?:\s+|[-–—]\s*)\S"
+)
 
 
 def slugify(filename: str) -> str:
@@ -1566,13 +2468,18 @@ def normalize_markdown_text(md_text: str) -> str:
     return text.strip()
 
 
-def _paginas_sem_texto_nativo(doc: "pymupdf.Document", min_chars: int = _OCR_MIN_CHARS) -> dict:
+def _paginas_sem_texto_nativo(
+    doc: "pymupdf.Document",
+    min_chars: int = _OCR_MIN_CHARS,
+) -> tuple:
     """Roda OCR manual só nas páginas sem texto nativo suficiente (páginas
     genuinamente escaneadas). Não toca em páginas com texto digital, mesmo
     que tenham imagens grandes -- é exatamente esse caso que o classificador
-    automático da lib erra (ver docstring do módulo).
+    automático da lib erra (ver docstring do módulo). Também devolve os blocos
+    posicionados do OCR para que as imagens possam ser ancoradas no fluxo.
     """
     resultado = {}
+    blocos_ocr_por_pagina = {}
     for page in doc:
         nativo = page.get_text().strip()
         if len(nativo) >= min_chars:
@@ -1581,11 +2488,22 @@ def _paginas_sem_texto_nativo(doc: "pymupdf.Document", min_chars: int = _OCR_MIN
             tp = page.get_textpage_ocr(full=True, language="por+eng", dpi=200)
             texto_ocr = page.get_text(textpage=tp).strip()
         except Exception as exc:  # noqa: BLE001 -- não deixa uma página ruim derrubar o job inteiro
+            if "Tesseract is not installed" in str(exc):
+                raise RuntimeError(
+                    "OCR é necessário para páginas sem texto extraível, mas o Tesseract "
+                    "não está instalado. A conversão foi interrompida para evitar gerar "
+                    "uma nota sem o texto dessas páginas."
+                ) from exc
             print(f"aviso: OCR falhou na página {page.number + 1}: {exc}", file=sys.stderr)
             continue
         if texto_ocr:
             resultado[page.number] = texto_ocr
-    return resultado
+            blocos_ocr_por_pagina[page.number] = [
+                block
+                for block in page.get_text("dict", textpage=tp).get("blocks", [])
+                if block.get("type") == 0
+            ]
+    return resultado, blocos_ocr_por_pagina
 
 
 def _aplicar_ocr_manual(md_text: str, ocr_por_pagina: dict) -> str:
@@ -1620,7 +2538,9 @@ def _aplicar_ocr_manual(md_text: str, ocr_por_pagina: dict) -> str:
 def _precisa_aspas(valor: str) -> bool:
     if valor != valor.strip():
         return True
-    return bool(re.search(r'[:#\[\]{}]|^[\-?!&*|>%@`"\']', valor))
+    return bool(
+        re.search(r'[:#\[\]{}]|^[\-?!&*|>%@`"\']', valor)
+    )
 
 
 def _yaml_escalar(valor: str) -> str:
@@ -1643,6 +2563,7 @@ def detect_assunto(md_text: str, max_linhas: int = 15, max_varredura: int = 40) 
         # pymupdf4llm às vezes renderiza o primeiro item como heading ("## ")
         # e cada item seguinte como bullet ("- "); remove os dois antes de testar.
         conteudo = linha.lstrip("#-* ").strip()
+        conteudo = re.sub(r"^\*\*(.*?)\*\*$", r"\1", conteudo).strip()
         if not conteudo:
             if outline:
                 continue  # tolera linha em branco entre itens do sumário
@@ -1698,6 +2619,26 @@ def build_frontmatter(meta: dict) -> str:
     return "\n".join(lines)
 
 
+def _processar_notas_rodape_posicionais(md_text: str) -> tuple:
+    partes = _PAGE_NOTE_RE.split(md_text)
+    saida = []
+    notas = []
+    contador = 0
+    for indice in range(0, len(partes), 2):
+        conteudo = partes[indice]
+        conteudo, notas_pagina = _extrair_notas_rodape_pagina(conteudo)
+        for numero, corpo in notas_pagina:
+            contador += 1
+            conteudo = re.sub(
+                rf"\[\^{re.escape(numero)}\]", f"[^{contador}]", conteudo
+            )
+            notas.append((contador, corpo))
+        saida.append(conteudo)
+        if indice + 1 < len(partes):
+            saida.append(partes[indice + 1])
+    return "".join(saida), notas
+
+
 def convert_pdf(input_path: str, job_dir: str, meta: dict, crop_watermark: bool = False) -> dict:
     """Converte um PDF em Markdown para Obsidian dentro de job_dir.
 
@@ -1711,119 +2652,29 @@ def convert_pdf(input_path: str, job_dir: str, meta: dict, crop_watermark: bool 
     os.makedirs(job_dir, exist_ok=True)
     img_dir = os.path.join(job_dir, "images")
     os.makedirs(img_dir, exist_ok=True)
-
-    with pymupdf.open(input_path) as doc:
-        caracteristicas = []
-        for page in doc:
-            blocks = page.get_text("dict").get("blocks", [])
-            imagens = [block for block in blocks if block.get("type") == 1]
-            area_imagens = sum(
-                max(0, block["bbox"][2] - block["bbox"][0])
-                * max(0, block["bbox"][3] - block["bbox"][1])
-                for block in imagens
-            )
-            chars_nativos = sum(
-                len(span.get("text", ""))
-                for block in blocks if block.get("type") == 0
-                for line in block.get("lines", [])
-                if line.get("bbox", (0, 0, 0, 0))[1] < page.rect.height * 0.93
-                for span in line.get("spans", [])
-            )
-            cobertura = area_imagens / (page.rect.width * page.rect.height)
-            caracteristicas.append(bool(imagens) and cobertura >= 0.20 and chars_nativos <= 250)
-        modo_visual = bool(caracteristicas) and all(caracteristicas)
-
-    if modo_visual:
-        md_text, n_images = _extrair_layout_pdf(
-            input_path, img_dir, meta.get("display_name") or meta["slug"], crop_watermark
-        )
-        notas_rodape = []
-        assunto_lines = []
-    else:
-        doc = pymupdf.open(input_path)
-        try:
-            ocr_por_pagina = _paginas_sem_texto_nativo(doc)
-            ancoras_por_pagina = _ancoras_de_imagem_por_pagina(doc)
-            sites_no_rodape = _sites_no_rodape_pdf(doc)
-        finally:
-            doc.close()
-
-        md_text = pymupdf4llm.to_markdown(
-            input_path,
-            write_images=True,
-            image_path=img_dir,
-            image_format="png",
-            page_separators=True,
-        )
-        md_text = _aplicar_ocr_manual(md_text, ocr_por_pagina)
-        md_text = _remover_sites_por_posicao(md_text, sites_no_rodape)
-        md_text = _converter_notas_rodape_sup(md_text)
-        md_text = normalize_markdown_text(md_text)
-        assunto_lines = detect_assunto(md_text)
-        md_text, notas_rodape = process_pages_apostila(md_text, ancoras_por_pagina)
-        md_text = _processar_indice(md_text)
-        md_text = _destacar_citacoes_de_lei(md_text)
-        md_text = _destacar_jurisprudencia(md_text)
-        md_text = _aplicar_callouts_alerta(md_text)
-
-    if not modo_visual and _eh_perfil_direito(meta):
-        image_stem = meta.get("slug") or slugify(
-            meta.get("display_name") or os.path.basename(input_path)
-        )
-        md_text = _renderizar_tabelas_como_imagens(
-            md_text,
-            input_path,
-            img_dir,
-            image_stem,
-        )
-
+    nome = meta.get("display_name") or meta["slug"]
+    image_stem = meta.get("slug") or slugify(nome or os.path.basename(input_path))
+    md_text, n_images = _extrair_layout_pdf(
+        input_path,
+        img_dir,
+        image_stem,
+        crop_watermark,
+        _eh_perfil_direito(meta),
+    )
+    md_text, notas_rodape = _processar_notas_rodape_posicionais(md_text)
+    md_text = _destacar_citacoes_de_lei(md_text)
+    md_text = _destacar_jurisprudencia(md_text)
+    md_text = _aplicar_callouts_alerta(md_text)
     md_text = _normalizar_simbolos_logicos(md_text)
     md_text = _remover_sites_residuais(md_text)
+    md_text = re.sub(r"(?m)^--- end of page=\d+ ---\s*$", "", md_text)
+    md_text = re.sub(r"(?m)^(#{1,3})\s+", r"#### ", md_text)
+    assunto_lines = detect_assunto(md_text)
 
-    nome = meta.get("display_name") or meta["slug"]
-    contador = {"n": 0}
-
-    def _fix_link(match: "re.Match") -> str:
-        old_basename = os.path.basename(match.group(1))
-        suffix = _IMG_SUFFIX_RE.search(old_basename)
-        if suffix:
-            # page.number no caminho legado é 0-indexado; +1 pra bater com a
-            # numeração de página real que o usuário vê no PDF.
-            pagina = int(suffix.group(1)) + 1
-            ext = suffix.group(2)
-        else:
-            pagina = 0
-            ext = old_basename.rsplit(".", 1)[-1] if "." in old_basename else "png"
-
-        contador["n"] += 1
-        # Numeração sequencial global (ordem de leitura, já é a ordem em que
-        # o pymupdf4llm emite as imagens no texto) + página real do PDF --
-        # ex: DCA1-img1-pg2.png, DCA1-img2-pg2.png (2ª imagem, mesma página).
-        new_basename = f"{nome}-img{contador['n']}-pg{pagina}.{ext}"
-
-        old_path = os.path.join(img_dir, old_basename)
-        new_path = os.path.join(img_dir, new_basename)
-        if old_basename != new_basename and os.path.exists(old_path) and not os.path.exists(new_path):
-            os.rename(old_path, new_path)
-        # Embed no estilo wikilink do Obsidian: só o nome do arquivo, sem
-        # caminho -- o Obsidian resolve pelo vault inteiro, igual ao padrão
-        # observado na nota de referência (![[Pasted image ...]]).
-        return f"![[{new_basename}]]"
-
-    if not modo_visual:
-        md_text = _IMG_LINK_RE.sub(_fix_link, md_text)
-
-    # Checagem de sanidade (só avisa em stderr, não falha o job): garante
-    # que nenhum passo acima moveu uma imagem para fora da página do PDF
-    # de onde ela foi extraída.
     _verificar_imagens_mesma_pagina(md_text)
 
-    # Remove a pasta de imagens se o documento não gerou nenhuma
     if os.path.isdir(img_dir) and not os.listdir(img_dir):
         os.rmdir(img_dir)
-
-    if not modo_visual:
-        n_images = len(os.listdir(img_dir)) if os.path.isdir(img_dir) else 0
 
     meta = dict(meta)
     meta["assunto_lines"] = assunto_lines
@@ -1832,8 +2683,6 @@ def convert_pdf(input_path: str, job_dir: str, meta: dict, crop_watermark: bool 
     frontmatter = build_frontmatter(meta)
 
     partes = [frontmatter]
-    if assunto_lines:
-        partes.append(_formatar_bloco_assunto(assunto_lines))
     partes.append(md_text.strip())
     if notas_rodape:
         partes.append("\n".join(f"[^{n}]: {corpo}" for n, corpo in notas_rodape))
