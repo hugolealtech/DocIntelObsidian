@@ -135,6 +135,20 @@ o que é pior que deixar em branco pra você revisar manualmente.
   clusters vetoriais consideram apenas preenchimentos coloridos e molduras
   grandes menores que a página. Linhas OCR/nativas sobrepostas a uma figura
   não são repetidas no corpo.
+- **Reconstrução de tabelas nativas**: a grade é identificada pelo PyMuPDF e
+  o texto de cada célula é refeito pela posição dos caracteres, em vez de
+  confiar no Markdown fragmentado do extrator. Isso recupera separações entre
+  palavras e pontuação, preserva itens de lista com `<br>` e escapa `|` dentro
+  das células. Fragmentos com a mesma grade no fim/início de páginas
+  consecutivas são reunidos em uma tabela, mantendo o cabeçalho original,
+  anexando continuações às células correspondentes e removendo colunas
+  totalmente vazias. Na disciplina Direito, tabelas compactas com até 3 linhas
+  e 4 ou mais colunas são preservadas como imagem da página, com o texto
+  extraído em um callout recolhido (`> [!note]- Texto da tabela`), para evitar
+  reconstruções visuais pouco fiéis. A extração geométrica também usa limites
+  para células mescladas e texto suspeito; esses valores podem ser ajustados
+  no início de `app/tabelas.py`. Tabelas simples de Lógica continuam como
+  Markdown.
 - **OCR seletivo**: só páginas com menos de 30 caracteres nativos recebem OCR
   de página inteira (`por+eng`, 300 DPI). O OCR usa a mesma ordem geométrica;
   o texto reconhecido dentro de figuras fica em callout recolhido, não como
@@ -142,6 +156,8 @@ o que é pior que deixar em branco pra você revisar manualmente.
   figura para busca e para a opção de corte de marca d'água.
 - `pymupdf4llm.use_layout(False)` permanece ativo para o pipeline de
   legislação, evitando que seu classificador ONNX substitua texto nativo.
+  A reconstrução geométrica de tabelas pertence ao pipeline de apostilas e
+  não altera a conversão de legislação.
 - **Símbolos lógicos**: variantes ASCII/OCR são normalizadas para Unicode
   somente em contexto de fórmula (por exemplo, `P v Q` → `P ∨ Q`, `P > Q` →
   `P ⇒ Q`, `P = Q` → `P ⇔ Q`). Letras `v`, `A` e símbolos semelhantes na
