@@ -144,6 +144,16 @@ G7JURIDICO<br><!-- End of picture text -->
             "A questão P ? Q",
         )
 
+    def test_normalizar_simbolos_logicos_preserves_markdown_strikethrough(self):
+        raw = (
+            "~~I - praticar ato visando fim proibido em lei ou regulamento~~ "
+            "~~II - retardar ou deixar de praticar ato de ofício~~"
+        )
+        self.assertEqual(
+            converter._normalizar_simbolos_logicos(raw),
+            raw,
+        )
+
     def test_converter_pdf_normaliza_formula_e_remove_site_na_faixa_inferior(self):
         import pymupdf
 
@@ -200,9 +210,47 @@ G7JURIDICO<br><!-- End of picture text -->
                 self.assertEqual(merged.size, (300, 200))
 
         self.assertEqual(result["n_images"], 1)
-        self.assertIn("# ROTEIRO DE AULA", markdown)
-        self.assertLess(markdown.index("# ROTEIRO DE AULA"), markdown.index("![[Current_Stem-pg1-fig1.png]]"))
+        self.assertIn("### ROTEIRO DE AULA", markdown)
+        self.assertLess(markdown.index("### ROTEIRO DE AULA"), markdown.index("![[Current_Stem-pg1-fig1.png]]"))
         self.assertNotIn("[[ROTEIRO DE AULA]]", markdown)
+
+    def test_visual_title_levels_follow_numbering_and_leave_prose_unmarked(self):
+        def make_line(text, bold=True):
+            return {"spans": [{"text": text, "flags": 16 if bold else 0}]}
+
+        state = {"nivel": None}
+        self.assertEqual(
+            converter._texto_linha_pdf(make_line("3. Título principal"), state),
+            "### 3. Título principal",
+        )
+        self.assertEqual(
+            converter._texto_linha_pdf(make_line("3.1 Subtítulo"), state),
+            "#### 3.1 Subtítulo",
+        )
+        self.assertEqual(
+            converter._texto_linha_pdf(make_line("3.1.2 Neto"), state),
+            "##### 3.1.2 Neto",
+        )
+        self.assertEqual(
+            converter._texto_linha_pdf(make_line("3.1.2.4 Profundidade máxima"), state),
+            "###### 3.1.2.4 Profundidade máxima",
+        )
+        self.assertEqual(
+            converter._texto_linha_pdf(make_line("1. Texto corrido numerado", bold=False), state),
+            "1. Texto corrido numerado",
+        )
+        self.assertEqual(
+            converter._texto_linha_pdf(make_line("1. Esta é uma frase completa."), state),
+            "**1. Esta é uma frase completa.**",
+        )
+        self.assertEqual(
+            converter._texto_linha_pdf(make_line("Destaque no corpo"), state),
+            "**Destaque no corpo**",
+        )
+        self.assertEqual(
+            converter._texto_linha_pdf(make_line("### 3.1 Título já marcado"), state),
+            "#### 3.1 Título já marcado",
+        )
 
     def test_crop_watermark_is_disabled_by_default_and_explicit_when_requested(self):
         import pymupdf
@@ -315,9 +363,9 @@ class ApostilaOnlyTests(unittest.TestCase):
             "Texto normal do corpo da aula."
         )
         out = converter._processar_indice(md)
-        self.assertIn("# Sumário", out)
-        self.assertIn("#### Controle de constitucionalidade", out)
-        self.assertIn("##### 1- Teoria Geral", out)
+        self.assertIn("### Sumário", out)
+        self.assertIn("### Controle de constitucionalidade", out)
+        self.assertIn("#### 1- Teoria Geral", out)
         self.assertNotIn("[[Sumário]]", out)
         self.assertNotIn("[[Controle de constitucionalidade]]", out)
         # não mexe no que vem depois do índice
@@ -334,7 +382,7 @@ class ApostilaOnlyTests(unittest.TestCase):
         out = converter._formatar_bloco_assunto(linhas)
         self.assertEqual(
             out,
-            "# 3. Poder Executivo\n"
+            "### 3. Poder Executivo\n"
             "#### 3.1 exercício do poder executivo\n"
             "#### 3.6 Imunidades do Presidente\n"
             "##### 3.1.2 Competências",

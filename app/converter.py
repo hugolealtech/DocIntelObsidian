@@ -649,12 +649,13 @@ def _classificar_linha_indice(linha: str):
     -- nivel 0 = item "pai" (título de seção, ou "N. Texto" sem subitem),
     nivel 1 = item "filho" (subitem numerado, "N-texto" ou "N.M texto").
     Devolve None se não parecer índice."""
+    linha = re.sub(r"^#{1,6}\s+", "", linha.strip())
     m = _INDICE_HEADING_RE.match(linha)
     if m:
         return (0, m.group(1).strip())
     m = _INDICE_CHILD_DOTNUM_RE.match(linha)
     if m:
-        nivel = min(m.group(1).count("."), 2)
+        nivel = min(m.group(1).count("."), 3)
         numero = re.sub(r"\s*\.\s*", ".", m.group(1))
         return (nivel, f"{numero} {m.group(2)}".strip())
     m = _INDICE_PARENT_NUM_RE.match(linha)
@@ -669,9 +670,10 @@ def _classificar_linha_indice(linha: str):
 def _formatar_item_indice(texto: str, nivel: int = 0) -> str:
     texto = texto.strip().rstrip(":").strip()
     texto = re.sub(r"^\*\*|\*\*$", "", texto).strip()
+    texto = re.sub(r"^#{1,6}\s*", "", texto).strip()
     if not texto:
         return ""
-    nivel_heading = (1, 4, 5)[min(nivel, 2)]
+    nivel_heading = 3 + min(max(nivel, 0), 3)
     return f"{'#' * nivel_heading} {texto}"
 
 
@@ -726,9 +728,8 @@ def _processar_indice(md_text: str) -> str:
         return md_text
 
     linhas_saida = []
-    for indice, (nivel, texto) in enumerate(itens):
-        nivel_heading = 0 if indice == 0 else (1 if nivel == 0 else min(nivel + 1, 2))
-        heading = _formatar_item_indice(texto, nivel_heading)
+    for nivel, texto in itens:
+        heading = _formatar_item_indice(texto, nivel)
         if heading:
             linhas_saida.append(heading)
 
@@ -1019,6 +1020,13 @@ def _normalizar_simbolos_logicos(md_text: str) -> str:
     for linha in md_text.splitlines(keepends=True):
         conteudo = linha.rstrip("\r\n")
         terminador = linha[len(conteudo):]
+        tachados = []
+
+        def _proteger_tachado(match: re.Match) -> str:
+            tachados.append(match.group(0))
+            return f"\x00{len(tachados) - 1}\x00"
+
+        conteudo = re.sub(r"~~(?=\S).*?\S~~", _proteger_tachado, conteudo)
         glifos_privados = []
         for indice, caractere in enumerate(conteudo):
             anterior = conteudo[:indice].rstrip()
@@ -1087,6 +1095,8 @@ def _normalizar_simbolos_logicos(md_text: str) -> str:
                 ),
                 conteudo,
             )
+        for indice, tachado in enumerate(tachados):
+            conteudo = conteudo.replace(f"\x00{indice}\x00", tachado)
         saida.append(conteudo + terminador)
     return "".join(saida)
 
@@ -1214,23 +1224,27 @@ def _texto_linha_pdf(line: dict, titulo_state: dict) -> str:
         return texto
 
     titulo = re.sub(r"\s+", " ", texto).strip()
+    titulo = re.sub(r"^#{1,6}\s*", "", titulo).strip()
     normalizado = titulo.casefold()
     if normalizado == "roteiro de aula":
-        titulo_state["principal"] = True
-        return f"# {titulo}"
+        titulo_state["nivel"] = 0
+        return _formatar_item_indice(titulo, 0)
     numeracao = re.match(r"^(\d+(?:\.\d+)*)(?:[.)])?\s+", titulo)
     if numeracao:
+        if re.search(r"[.!?]$", titulo):
+            return f"**{texto}**"
         profundidade = numeracao.group(1).count(".")
-        nivel = 1 if profundidade == 0 else (4 if profundidade == 1 else 5)
-        titulo_state["principal"] = True
-        return f"{'#' * nivel} {titulo}"
+        titulo_state["nivel"] = min(profundidade, 3)
+        return _formatar_item_indice(titulo, titulo_state["nivel"])
     if re.fullmatch(r"bloco\s+\d+", normalizado):
-        return f"#### {titulo}"
-    if titulo_state["principal"] and (
+        nivel = min((titulo_state.get("nivel") or 0) + 1, 3)
+        return _formatar_item_indice(titulo, nivel)
+    if titulo_state.get("nivel") is not None and (
         normalizado.startswith("lógica proposicional")
         or titulo.isupper()
     ):
-        return f"#### {titulo}"
+        nivel = min(titulo_state["nivel"] + 1, 3)
+        return _formatar_item_indice(titulo, nivel)
     return f"**{texto}**"
 
 
@@ -1264,7 +1278,7 @@ def _extrair_layout_pdf(
                 grupos.append([block])
 
             eventos = []
-            titulo_state = {"principal": False}
+            titulo_state = {"nivel": None}
             for block in blocos:
                 if block.get("type") != 0:
                     continue
