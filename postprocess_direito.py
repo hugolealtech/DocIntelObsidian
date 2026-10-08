@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 import difflib
 import os
 import re
@@ -11,6 +12,7 @@ EMPTY_PARENS_RE = re.compile(r"\(\s*\)")
 MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 NUMBERED_TITLE_RE = re.compile(r"^(\d+(?:\.\d+)*)\)\s+(.+)$")
 CONTINUATION_RE = re.compile(r"^\(continu(?:ação|ando)\)\s*(.*)$", re.IGNORECASE)
+STRIKETHROUGH_MARKER_RE = re.compile(r"¬{2,}(?P<text>.+?)¬{2,}")
 
 
 def _counts(text):
@@ -37,23 +39,24 @@ def _title_text(line):
 
 def _format_title(line, summary_item=False):
     title = _title_text(line)
+    display_title = _plain_title(line)
     if not title:
         return line
     if title.casefold() == "roteiro de aula":
-        return f"# {title}"
+        return f"# {display_title}"
     if title.casefold() == "sumário" or re.match(r"^Tema:\s*\S", title, re.IGNORECASE):
-        return f"## {title}"
+        return f"## {display_title}"
     if summary_item:
-        return f"- {title.lstrip('- ').strip()}"
+        return f"- {display_title.lstrip('- ').strip()}"
     if len(title) > 80 or title.endswith("."):
         return line
     if re.match(r"^Bloco\s+\d+\s*$", title, re.IGNORECASE):
-        return f"### {title}"
+        return f"### {display_title}"
     match = NUMBERED_TITLE_RE.match(title)
     if not match:
         return line
     depth = match.group(1).count(".")
-    return f"{'#' * min(3 + depth, 6)} {title}"
+    return f"{'#' * min(3 + depth, 6)} {display_title}"
 
 
 def _extract_table(pdf_path):
@@ -66,7 +69,10 @@ def _extract_table(pdf_path):
         rows = tables[0].extract()
     if len(rows) != 5 or any(len(row) != 3 for row in rows):
         raise ValueError(f"Tabela esperada 5x3; extração retornou {len(rows)} linhas")
-    rows = [[re.sub(r"\s+", " ", cell.replace("\n", " ")).strip().replace("|", r"\|") for cell in row] for row in rows]
+    rows = [
+        [(cell or "").replace("\n", " ").replace("|", r"\|") for cell in row]
+        for row in rows
+    ]
     markdown = ["|" + "|".join(rows[0]) + "|", "|---|---|---|"]
     markdown.extend("|" + "|".join(row) + "|" for row in rows[1:])
     return "\n".join(markdown)
@@ -87,7 +93,7 @@ def _replace_broken_table(text, table):
 def _split_marker_line(line):
     quote = re.match(r"^(\s*>\s*)", line)
     quote_prefix = quote.group(1) if quote else ""
-    content = line
+    content = line[len(quote_prefix):] if quote else line
     content = re.sub(r"¬{2,}●¬{2,}\s*¬{2,}", "\n- ", content)
     content = re.sub(r"¬{2,}\s*¬{2,}", "\n", content)
     content = re.sub(r"¬{2,}", "\n", content)
@@ -95,14 +101,18 @@ def _split_marker_line(line):
     if not pieces:
         return [line]
     result = []
-    for index, piece in enumerate(pieces):
+    for piece in pieces:
         if not piece.strip():
             continue
-        if index and quote_prefix:
-            result.append(quote_prefix + piece.lstrip())
-        else:
-            result.append(piece.rstrip())
+        result.append((quote_prefix if quote_prefix else "") + piece.rstrip())
     return result or ([quote_prefix.rstrip()] if quote_prefix else [])
+
+
+def _restore_strikethrough_markers(text):
+    return STRIKETHROUGH_MARKER_RE.sub(
+        lambda match: f"~~{match.group('text')}~~",
+        text,
+    )
 
 
 def _remove_page_number(content, page_number):
@@ -112,6 +122,8 @@ def _remove_page_number(content, page_number):
             continue
         match = re.match(r"^(?P<quote>\s*>\s*)?(?P<body>.*?)(?P<space>[ \t]+)(?P<number>\d+)[ \t]*$", lines[index])
         if match and match.group("number") == page_number:
+            if re.search(r"\bEra:.*\bPassou:", lines[index], re.IGNORECASE):
+                break
             remainder = match.group("body").rstrip()
             if not remainder and match.group("quote"):
                 lines.pop(index)
@@ -122,7 +134,7 @@ def _remove_page_number(content, page_number):
 
 
 def _split_long_clauses(line):
-    if len(line) < 240:
+    if len(line) < 240 or re.search(r"\bEra:.*\bPassou:", line, re.IGNORECASE):
         return [line]
     quote = re.match(r"^(\s*>\s*)", line)
     quote_prefix = quote.group(1) if quote else ""
@@ -132,7 +144,7 @@ def _split_long_clauses(line):
         content,
         flags=re.IGNORECASE,
     )
-    return [quote_prefix + chunk if index and quote_prefix else chunk for index, chunk in enumerate(chunks)]
+    return [quote_prefix + chunk for chunk in chunks]
 
 
 def _restore_titles(text):
@@ -192,18 +204,21 @@ def _format_titles(text):
         if in_summary and stripped == "---":
             in_summary = False
         if title.casefold() == "sumário":
-            formatted.append("## Sumário")
+            formatted.append(f"## {_plain_title(stripped)}")
             in_summary = True
             continue
         if in_summary and stripped:
             if re.match(r"^Tema:\s*\S", title, re.IGNORECASE):
-                formatted.append(f"## {title}")
+                formatted.append(f"## {_plain_title(stripped)}")
             else:
                 summary_item = _plain_title(stripped).lstrip("- ").strip()
                 formatted.append(f"- {summary_item}")
             continue
         continuation = CONTINUATION_RE.match(title)
         if continuation:
+            if "**" in stripped or re.search(r"(?<!\*)\*(?!\*)", stripped):
+                formatted.append(line)
+                continue
             subject = continuation.group(1).strip()
             if subject and formatted and _plain_title(formatted[-1]).casefold() == subject.casefold():
                 continue
@@ -216,6 +231,7 @@ def _format_titles(text):
 
 def process(text, table):
     if text.count("¬"):
+        text = _restore_strikethrough_markers(text)
         text = _normalize_page_markers(text)
     text = _restore_titles(text)
     text = _replace_broken_table(text, table)
@@ -232,6 +248,13 @@ def _validate_preserved_content(before, after):
 
     if frontmatter(before) != frontmatter(after):
         raise ValueError("Front matter foi alterado")
+    emphasis_pattern = re.compile(
+        r"\*\*[^*\n]+?\*\*|(?<!\*)\*(?!\*)[^*\n]+?(?<!\*)\*(?!\*)"
+    )
+    before_emphasis = Counter(emphasis_pattern.findall(before))
+    after_emphasis = Counter(emphasis_pattern.findall(after))
+    if before_emphasis - after_emphasis:
+        raise ValueError("Negritos ou itálicos foram alterados")
     for pattern, name in (
         (r"!\[\[[^\]\n]+\]\]", "imagens"),
         (r"(?m)^> \[!(?:quote|attention)\].*$", "callouts"),
@@ -248,6 +271,8 @@ def _validate_preserved_content(before, after):
         line.strip() == "---" for line in after.splitlines()
     ):
         raise ValueError("Marcadores horizontais foram alterados")
+    if len(re.findall(r"(?m)^>", after)) < len(re.findall(r"(?m)^>", before)):
+        raise ValueError("Linhas de citação foram removidas")
 
 
 def main():
@@ -279,7 +304,6 @@ def main():
     if any(line.rstrip().endswith("–") for line in transformed.splitlines()):
         raise SystemExit("Validação falhou: título ainda termina com '–'")
 
-    print(f"Backup: {backup}")
     print(f"Contagens antes: {before}")
     print(f"Contagens depois: {after}")
     print("Diff das linhas alteradas:")
@@ -292,9 +316,6 @@ def main():
         temporary = target.with_suffix(target.suffix + ".tmp")
         temporary.write_text(transformed, encoding="utf-8")
         os.replace(temporary, target)
-        print(f"Aplicado: {target}")
-    else:
-        print("Prévia apenas; use --apply para sobrescrever o Markdown.")
 
 
 if __name__ == "__main__":

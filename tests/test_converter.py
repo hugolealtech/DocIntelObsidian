@@ -40,6 +40,68 @@ G7JURIDICO<br><!-- End of picture text -->
         self.assertIn("|---|---|---|", output)
         self.assertIn("|Enriquecimento ilícito|Lesão ao erário|Violação a princípio|", output)
 
+    def test_derecho_profile_renders_detected_table_as_page_image(self):
+        import pymupdf
+
+        self.assertTrue(converter._eh_perfil_direito({"disciplina": "Direito da Criança"}))
+        self.assertFalse(converter._eh_perfil_direito({"disciplina": "Lógica"}))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = os.path.join(temp_dir, "direito.pdf")
+            image_dir = os.path.join(temp_dir, "images")
+            os.makedirs(image_dir)
+            doc = pymupdf.open()
+            page = doc.new_page(width=300, height=240)
+            page.insert_text((40, 30), "Quadro de teste com texto nativo suficiente")
+            for x in (40, 95, 150, 205, 260):
+                page.draw_line((x, 60), (x, 160))
+            for y in (60, 110, 160):
+                page.draw_line((40, y), (260, y))
+            page.insert_text((55, 90), "A")
+            page.insert_text((110, 90), "B")
+            page.insert_text((165, 90), "C")
+            page.insert_text((220, 90), "D")
+            page.insert_text((55, 140), "C")
+            page.insert_text((110, 140), "D")
+            page.insert_text((165, 140), "E")
+            page.insert_text((220, 140), "F")
+            doc.save(pdf_path)
+            doc.close()
+
+            markdown = (
+                "Título\n\n|A|B|C|D|\n|---|---|---|---|\n|C|D|E|F|"
+                "\n\n---\n*p. 1*\n\n---\n\nTexto depois."
+            )
+            output = converter._renderizar_tabelas_como_imagens(
+                markdown, pdf_path, image_dir, "direito"
+            )
+
+            self.assertIn("![[direito-table1-pg1.png]]", output)
+            self.assertNotIn("|---|", output)
+            self.assertIn("Texto depois.", output)
+            self.assertTrue(os.path.isfile(os.path.join(image_dir, "direito-table1-pg1.png")))
+
+            derecho_dir = os.path.join(temp_dir, "derecho-output")
+            result = converter.convert_pdf(
+                pdf_path,
+                derecho_dir,
+                {"slug": "derecho", "display_name": "DIR Ejemplo", "disciplina": "Direito"},
+            )
+            with open(result["md_path"], encoding="utf-8") as markdown_file:
+                derecho_markdown = markdown_file.read()
+            self.assertIn("![[derecho-table1-pg1.png]]", derecho_markdown)
+
+            logic_dir = os.path.join(temp_dir, "logic-output")
+            result = converter.convert_pdf(
+                pdf_path,
+                logic_dir,
+                {"slug": "logica", "display_name": "Lógica", "disciplina": "Lógica"},
+            )
+            with open(result["md_path"], encoding="utf-8") as markdown_file:
+                logic_markdown = markdown_file.read()
+            self.assertIn("|---|---|---|---|", logic_markdown)
+            self.assertEqual(result["n_images"], 0)
+
     def test_slugify_uses_safe_name(self):
         self.assertEqual(converter.slugify("DCA4.pdf"), "dca4")
         self.assertEqual(converter.slugify("Aula_05_Constitucional.pdf"), "aula-05-constitucional")

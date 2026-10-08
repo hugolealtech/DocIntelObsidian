@@ -82,6 +82,9 @@ _IMG_SUFFIX_RE = re.compile(r"-(\d+)-(?:full|\d+)\.(png|jpe?g|webp)$", re.IGNORE
 # ÚLTIMA página do documento fica colado ao fim da string depois do
 # `.strip()` de `normalize_markdown_text`, sem "\n\n" depois dele.
 _PAGE_SEP_RE = re.compile(r"\n+--- end of page=(\d+) ---\n*")
+_PAGE_NOTE_RE = re.compile(r"(\n\n---\n\*p\. \d+\*\n\n---\n\n)")
+_MARKDOWN_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_MARKDOWN_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|(?:\s*:?-{3,}:?\s*\|)+\s*$")
 
 # Ruído comum de OCR/HTML que sobra no texto (comentários de "texto de
 # imagem", tags soltas) -- limpar deixa a nota legível no Obsidian.
@@ -1363,6 +1366,147 @@ def _verificar_imagens_mesma_pagina(md_text: str) -> None:
         i += 2
 
 
+def _eh_perfil_direito(meta: dict) -> bool:
+    identificadores = " ".join(
+        str(meta.get(chave) or "")
+        for chave in ("disciplina", "display_name", "original_filename", "slug")
+    )
+    return bool(
+        re.search(r"\bdireito\b", identificadores, re.IGNORECASE)
+        or re.search(r"(?:^|[\s._-])dir(?:eito)?(?:$|[\s._-])", identificadores, re.IGNORECASE)
+    )
+
+
+def _substituir_tabelas_markdown_por_imagens(content: str, image_links: list) -> str:
+    linhas = content.splitlines()
+    substituicoes = iter(image_links)
+    resultado = []
+    i = 0
+    encontrados = 0
+
+    while i < len(linhas):
+        if not _MARKDOWN_TABLE_ROW_RE.match(linhas[i]):
+            resultado.append(linhas[i])
+            i += 1
+            continue
+
+        inicio = i
+        fim = i + 1
+        separador_visto = bool(_MARKDOWN_TABLE_SEPARATOR_RE.match(linhas[i]))
+        while fim < len(linhas):
+            if separador_visto and _MARKDOWN_TABLE_ROW_RE.match(linhas[fim]):
+                proxima_linha = fim + 1
+                while proxima_linha < len(linhas) and not linhas[proxima_linha].strip():
+                    proxima_linha += 1
+                if (
+                    proxima_linha < len(linhas)
+                    and _MARKDOWN_TABLE_SEPARATOR_RE.match(linhas[proxima_linha])
+                ):
+                    break
+            if _MARKDOWN_TABLE_ROW_RE.match(linhas[fim]):
+                separador_visto = separador_visto or bool(
+                    _MARKDOWN_TABLE_SEPARATOR_RE.match(linhas[fim])
+                )
+                fim += 1
+                continue
+            if not linhas[fim].strip():
+                proxima_linha = fim + 1
+                while proxima_linha < len(linhas) and not linhas[proxima_linha].strip():
+                    proxima_linha += 1
+                if proxima_linha < len(linhas) and _MARKDOWN_TABLE_ROW_RE.match(linhas[proxima_linha]):
+                    fim = proxima_linha
+                    continue
+            break
+
+        bloco = linhas[inicio:fim]
+        if len([linha for linha in bloco if _MARKDOWN_TABLE_ROW_RE.match(linha)]) >= 2:
+            try:
+                link = next(substituicoes)
+            except StopIteration:
+                resultado.extend(bloco)
+            else:
+                resultado.append(link)
+                encontrados += 1
+        else:
+            resultado.extend(bloco)
+        i = fim
+
+    if encontrados != len(image_links):
+        raise ValueError(
+            "Quantidade de tabelas Markdown não corresponde às tabelas detectadas no PDF "
+            f"({encontrados} substituídas, {len(image_links)} esperadas)"
+        )
+    return "\n".join(resultado)
+
+
+def _markdown_table_block_count(content: str) -> int:
+    return sum(
+        bool(_MARKDOWN_TABLE_SEPARATOR_RE.match(line))
+        for line in content.splitlines()
+    )
+
+
+def _is_complex_pdf_table(table) -> bool:
+    rows = table.extract()
+    return bool(rows) and len(rows) <= 3 and max(len(row) for row in rows) >= 4
+
+
+def _renderizar_tabelas_como_imagens(
+    md_text: str,
+    input_path: str,
+    img_dir: str,
+    image_stem: str,
+) -> str:
+    """No perfil Direito, renderiza como imagem quadros compactos com 4+ colunas."""
+    import pymupdf
+
+    partes = _PAGE_NOTE_RE.split(md_text)
+    with pymupdf.open(input_path) as doc:
+        for parte_index in range(0, len(partes), 2):
+            page_index = parte_index // 2
+            if page_index >= len(doc):
+                break
+            if _markdown_table_block_count(partes[parte_index]) == 0:
+                continue
+            page = doc[page_index]
+            tabelas = sorted(
+                (
+                    tabela
+                    for tabela in page.find_tables().tables
+                    if _is_complex_pdf_table(tabela)
+                ),
+                key=lambda tabela: (tabela.bbox[1], tabela.bbox[0]),
+            )
+            if not tabelas:
+                continue
+            markdown_tables = _markdown_table_block_count(partes[parte_index])
+            if markdown_tables != len(tabelas):
+                raise ValueError(
+                    f"Página {page_index + 1}: {markdown_tables} tabelas Markdown, "
+                    f"mas {len(tabelas)} tabelas detectadas no PDF"
+                )
+
+            links = []
+            for table_index, tabela in enumerate(tabelas, start=1):
+                rect = pymupdf.Rect(tabela.bbox)
+                rect.x0 = max(page.rect.x0, rect.x0 - 3)
+                rect.y0 = max(page.rect.y0, rect.y0 - 3)
+                rect.x1 = min(page.rect.x1, rect.x1 + 3)
+                rect.y1 = min(page.rect.y1, rect.y1 + 3)
+                filename = f"{image_stem}-table{table_index}-pg{page_index + 1}.png"
+                page.get_pixmap(
+                    matrix=pymupdf.Matrix(2, 2),
+                    clip=rect,
+                    alpha=False,
+                ).save(os.path.join(img_dir, filename))
+                links.append(f"![[{filename}]]")
+
+            partes[parte_index] = _substituir_tabelas_markdown_por_imagens(
+                partes[parte_index], links
+            )
+    return "".join(partes)
+
+
 # Detecta um item de sumário numerado no estilo usado nos slides das aulas:
 # "4. Poder Legislativo", "4.6 Imunidades...", "5- Processo legislativo...",
 # "5.1. Introdução". Testado contra a nota de referência do usuário.
@@ -1621,6 +1765,17 @@ def convert_pdf(input_path: str, job_dir: str, meta: dict, crop_watermark: bool 
         md_text = _destacar_citacoes_de_lei(md_text)
         md_text = _destacar_jurisprudencia(md_text)
         md_text = _aplicar_callouts_alerta(md_text)
+
+    if not modo_visual and _eh_perfil_direito(meta):
+        image_stem = meta.get("slug") or slugify(
+            meta.get("display_name") or os.path.basename(input_path)
+        )
+        md_text = _renderizar_tabelas_como_imagens(
+            md_text,
+            input_path,
+            img_dir,
+            image_stem,
+        )
 
     md_text = _normalizar_simbolos_logicos(md_text)
     md_text = _remover_sites_residuais(md_text)
