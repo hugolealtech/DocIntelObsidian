@@ -24,6 +24,22 @@ G7JURIDICO<br><!-- End of picture text -->
         self.assertNotIn("<br>", cleaned)
         self.assertIn("Poder Executivo", cleaned)
 
+    def test_normalize_preserves_line_breaks_inside_markdown_table_rows(self):
+        raw = (
+            "Texto antes<br>da tabela\n\n"
+            "|Art. 9º Constituição<br>administrativa|Art. 10 lesão|Art. 11 princípios|\n"
+            "|---|---|---|\n"
+            "|Enriquecimento ilícito|Lesão ao erário|Violação a princípio|"
+        )
+
+        cleaned = converter.normalize_markdown_text(raw)
+        output = converter.reflow_paragraphs(cleaned)
+
+        self.assertIn("Texto antes\nda tabela", cleaned)
+        self.assertIn("Art. 9º Constituição<br>administrativa", output)
+        self.assertIn("|---|---|---|", output)
+        self.assertIn("|Enriquecimento ilícito|Lesão ao erário|Violação a princípio|", output)
+
     def test_slugify_uses_safe_name(self):
         self.assertEqual(converter.slugify("DCA4.pdf"), "dca4")
         self.assertEqual(converter.slugify("Aula_05_Constitucional.pdf"), "aula-05-constitucional")

@@ -86,7 +86,7 @@ _PAGE_SEP_RE = re.compile(r"\n+--- end of page=(\d+) ---\n*")
 # Ruído comum de OCR/HTML que sobra no texto (comentários de "texto de
 # imagem", tags soltas) -- limpar deixa a nota legível no Obsidian.
 _HTML_TAG_RE = re.compile(
-    r"</?(?:p|div|span|u|b|i|strong|em|font|sup|sub|table|tr|td|th|li|ul|ol|h\d|a|img)[^>]*>"
+    r"</?(?:p|div|span|u|b|i|strong|em|font|sup|sub|table|tr|td|th|li|ul|ol|h\d|a|img)\b[^>]*>"
 )
 _HTML_COMMENT_RE = re.compile(r"(?is)<!--.*?-->")
 
@@ -1398,7 +1398,11 @@ def normalize_markdown_text(md_text: str) -> str:
         return ""
     text = md_text.replace("\r\n", "\n").replace("\r", "\n")
     text = _HTML_COMMENT_RE.sub("", text)
-    text = re.sub(r"<br\s*/?>", "\n", text)
+    linhas = text.split("\n")
+    for indice, linha in enumerate(linhas):
+        if not linha.lstrip().startswith("|"):
+            linhas[indice] = re.sub(r"<br\s*/?>", "\n", linha)
+    text = "\n".join(linhas)
     text = _HTML_TAG_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
