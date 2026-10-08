@@ -8,7 +8,7 @@ do servidor FastAPI) tem dois motivos:
   2. Isolamento: um PDF corrompido ou malformado que trave/derrube o
      processo não derruba o servidor nem os outros jobs em andamento.
 
-Uso: python3 worker_convert.py <input_path> <job_dir> <meta_json_path> <result_json_path>
+Uso: python3 worker_convert.py <input_path> <job_dir> <meta_json_path> <result_json_path> [--crop-watermark]
 Escreve o resultado (md_path, n_images) como JSON em result_json_path -- não
 no stdout, porque o pymupdf4llm imprime mensagens de diagnóstico ali mesmo
 e misturaria com a saída.
@@ -22,8 +22,9 @@ import converter
 
 
 def main() -> int:
-    if len(sys.argv) != 5:
-        print("uso: worker_convert.py <input_path> <job_dir> <meta_json_path> <result_json_path>", file=sys.stderr)
+    argumentos = sys.argv[5:]
+    if len(sys.argv) < 5 or any(argumento != "--crop-watermark" for argumento in argumentos):
+        print("uso: worker_convert.py <input_path> <job_dir> <meta_json_path> <result_json_path> [--crop-watermark]", file=sys.stderr)
         return 2
 
     input_path, job_dir, meta_json_path, result_json_path = sys.argv[1:5]
@@ -36,7 +37,9 @@ def main() -> int:
         return 1
 
     try:
-        result = converter.convert_pdf(input_path, job_dir, meta)
+        result = converter.convert_pdf(
+            input_path, job_dir, meta, crop_watermark="--crop-watermark" in argumentos
+        )
     except Exception as exc:  # noqa: BLE001 -- worker isolado, precisa reportar qualquer falha
         print(str(exc), file=sys.stderr)
         return 1

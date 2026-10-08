@@ -27,6 +27,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 import zipfile
@@ -37,6 +38,7 @@ from fastapi.staticfiles import StaticFiles
 
 import converter
 import db
+from pdf_compression import COMPRESSION_LEVELS, compress_pdf
 
 UPLOADS_DIR = os.environ.get("DOCINTEL_UPLOADS", "/data/uploads")
 OUTPUT_DIR = os.environ.get("DOCINTEL_OUTPUT", "/data/output")
@@ -138,6 +140,7 @@ def _run_job(job_id: str) -> None:
             try:
                 with open(result_path, encoding="utf-8") as f:
                     result = json.load(f)
+                shutil.copy2(job["upload_path"], os.path.join(job_dir, "original.pdf"))
                 db.update_job(
                     job_id,
                     status="concluido",
@@ -317,6 +320,9 @@ async def convert(
         existing = db.find_done_by_hash(file_hash)
         if existing:
             # mesmo conteúdo já convertido antes: reaproveita a saída, não reprocessa
+            original_dest = os.path.join(existing["job_dir"], "original.pdf")
+            if not os.path.exists(original_dest):
+                shutil.copy2(upload_path, original_dest)
             db.update_job(
                 job_id,
                 status="concluido",
@@ -420,21 +426,37 @@ def job_delete(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/download-zip")
-def job_download_zip(job_id: str):
+def job_download_zip(job_id: str, compressao: str = "media"):
     job = db.get_job(job_id)
     if job is None or not job.get("md_path") or not os.path.exists(job["md_path"]):
         return JSONResponse({"erro": "arquivo não encontrado"}, status_code=404)
+    if compressao not in COMPRESSION_LEVELS:
+        return JSONResponse({"erro": "nível de compressão inválido"}, status_code=400)
 
     job_dir = job["job_dir"]
     md_path = job["md_path"]
     img_dir = os.path.join(job_dir, "images")
+    original_pdf = os.path.join(job_dir, "original.pdf")
 
     buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write(md_path, arcname=os.path.basename(md_path))
-        if os.path.isdir(img_dir):
-            for fname in sorted(os.listdir(img_dir)):
-                zf.write(os.path.join(img_dir, fname), arcname=f"images/{fname}")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            compressed_pdf = os.path.join(temp_dir, "original.pdf")
+            if os.path.isfile(original_pdf) and not compress_pdf(
+                original_pdf, compressed_pdf, COMPRESSION_LEVELS[compressao]
+            ):
+                return JSONResponse({"erro": "falha ao comprimir o PDF original (Ghostscript)"}, status_code=500)
+
+            with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                zf.write(md_path, arcname=os.path.basename(md_path))
+                if os.path.isdir(img_dir):
+                    for fname in sorted(os.listdir(img_dir)):
+                        zf.write(os.path.join(img_dir, fname), arcname=f"images/{fname}")
+                if os.path.isfile(original_pdf):
+                    pdf_arcname = os.path.basename(job["original_filename"])
+                    zf.write(compressed_pdf, arcname=pdf_arcname)
+    except OSError as exc:
+        return JSONResponse({"erro": f"falha ao preparar o ZIP: {exc}"}, status_code=500)
     buffer.seek(0)
 
     zip_name = os.path.splitext(os.path.basename(md_path))[0] + ".zip"

@@ -128,6 +128,12 @@
     font-family: var(--sans);
   }
   .field input:focus { outline: none; border-color: var(--accent); }
+  .zip-compression { margin: 0 0 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .zip-compression label { color: var(--muted); font-size: 12px; }
+  .zip-compression select {
+    background: var(--bg); border: 1px solid var(--panel-border); border-radius: 6px;
+    color: var(--text); padding: 7px 9px; font: inherit; font-size: 13px;
+  }
   .actions {
     margin-top: 18px;
     display: flex;
@@ -337,6 +343,14 @@
 
   <div class="card">
     <h2>Fila de conversão</h2>
+    <div class="zip-compression">
+      <label for="zipCompression">Compressão do PDF incluído no ZIP</label>
+      <select id="zipCompression">
+        <option value="menor">Menor</option>
+        <option value="media" selected>Média (padrão)</option>
+        <option value="maior">Maior</option>
+      </select>
+    </div>
     <table>
       <thead>
         <tr>
@@ -513,7 +527,8 @@ async function cancelJob(jobId) {
 async function downloadZip(jobId, suggestedName) {
   let blob;
   try {
-    const res = await fetch(`/api/jobs/${jobId}/download-zip`);
+    const compressao = document.getElementById('zipCompression').value || 'media';
+    const res = await fetch(`/api/jobs/${jobId}/download-zip?compressao=${encodeURIComponent(compressao)}`);
     if (!res.ok) throw new Error('servidor recusou o pedido');
     blob = await res.blob();
   } catch (err) {

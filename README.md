@@ -10,8 +10,8 @@ cd docintel
 docker compose up -d --build
 ```
 
-Isso constrói a imagem (instala Python, FastAPI e o Tesseract com português/
-inglês) e sobe o container `docintel` escutando na porta `8097`.
+Isso constrói a imagem (instala Python, FastAPI, Pillow e o Tesseract com
+português/inglês) e sobe o container `docintel` escutando na porta `8097`.
 
 Acesse: `http://<endereço-do-seu-servidor>:8097`
 
@@ -35,6 +35,7 @@ Não precisa de mais nada — o `docker-compose.yml` já cria as pastas
 output/
 └── <slug-do-arquivo>-<hash>/
     ├── <slug>.md        ← frontmatter YAML + conteúdo em Markdown
+    ├── original.pdf     ← PDF enviado, preservado para o ZIP
     └── images/          ← imagens extraídas, já referenciadas no .md
 ```
 
@@ -53,8 +54,8 @@ assunto: |-
 caminho: Direito Constitucional Aula 5
 ---
 
-- [[4. Poder Legislativo]]
-  - [[4.6 Imunidades dos congressistas]]
+# 4. Poder Legislativo
+#### 4.6 Imunidades dos congressistas
 
 ## Poder Legislativo (continuação)
 ...
@@ -63,24 +64,31 @@ caminho: Direito Constitucional Aula 5
 
 **O campo `assunto`** é preenchido por uma heurística: se o PDF começa com um
 bloco de linhas no formato de sumário numerado (`4.`, `4.6`, `5-`, `5.1.`...,
-comum nos slides de "assuntos de hoje"), essas linhas viram o `assunto` no
-frontmatter (como texto plano, sem `[[wikilink]]` -- o YAML não resolve
-link) e são espelhadas logo abaixo como lista aninhada com wikilinks (ver
-próximo parágrafo). Se o PDF não tiver esse padrão no início, o campo sai
-vazio — sem tentar adivinhar.
+comum nos slides de "assuntos de hoje"), essas linhas viram texto simples no
+frontmatter e são espelhadas no corpo como headings Markdown. O título
+principal usa `#`, os filhos `####` e os netos `#####`; títulos em negrito
+não são convertidos em wikilinks. Se o PDF não tiver esse padrão no início,
+o campo sai vazio — sem tentar adivinhar.
 
 **As imagens** são embutidas no formato wikilink do Obsidian (`![[nome.png]]`),
 igual ao padrão nativo de colar imagem no Obsidian — não precisa de caminho
-relativo, o Obsidian resolve pelo vault inteiro. Cada imagem fica dentro do
-bloco da MESMA página do PDF de onde foi extraída (uma checagem de sanidade
-roda no fim da conversão e avisa em log, sem falhar o job, se algum
-pós-processamento tiver movido uma imagem pra página errada).
+relativo, o Obsidian resolve pelo vault inteiro. Em PDFs de aula com páginas
+predominantemente visuais, texto e imagens são ordenados pelas coordenadas da
+página. Tiras adjacentes de mesma largura são empilhadas em uma figura quando
+a distância entre bordas é de até 3 unidades da página. Os arquivos seguem o
+padrão `<nome-do-pdf>-pg<N>-fig<K>.png`, preservando o nome do PDF enviado.
+
+Cada figura continua sendo a fonte visual principal. Como o projeto não usa
+um modelo de visão, o Tesseract gera apenas texto aproximado dentro de um
+callout recolhido (`> [!note]- Texto OCR (aproximado)`), para busca; esse OCR
+não é inserido como texto normal do enunciado. A ordem do Markdown intercala
+headings, texto nativo e figuras conforme sua posição no PDF.
 
 **O índice/sumário do início do documento** (título de seção + itens
-numerados do "assuntos de hoje", igual aparece nos slides) vira uma lista
-aninhada — item pai (seção) envolvendo os itens filhos (subitens
-numerados), replicando a hierarquia visual do PDF — com cada item entre
-`[[wikilinks]]`, pra virar nota própria no vault se você quiser.
+numerados do "assuntos de hoje", igual aparece nos slides) vira uma hierarquia
+de headings Markdown: o título principal usa `#`, filhos `####` e netos
+`#####`. Títulos em negrito também são preservados como headings, sem
+wikilinks automáticos.
 
 **Avisos didáticos** (linhas que começam com "Obs.", "Observação",
 "Atenção", "Cuidado", "Não se esqueça...") viram um callout
@@ -105,8 +113,7 @@ comum que comece citando "Art. 5º" de passagem). Revise o resultado antes
 de dar como definitivo.
 
 **O que continua de fora, de propósito:** `==destaques==` e `#tags` inline
-no corpo do texto, e `[[wikilinks]]` fora do índice/sumário (ex: pra outros
-conceitos citados no meio do texto). Decidir o que merece destaque no meio
+no corpo do texto, além de wikilinks conceituais automáticos. Decidir o que merece destaque no meio
 de um parágrafo de doutrina, ou qual conceito no corpo do texto merece
 virar link pra outra nota, depende de entender o conteúdo jurídico -- não
 só de reconhecer um padrão de posição/pontuação como o índice ou um "Obs.:"
@@ -115,19 +122,27 @@ o que é pior que deixar em branco pra você revisar manualmente.
 
 ## Como funciona
 
-- **Extração**: PyMuPDF4LLM faz a conversão para Markdown, preservando
-  hierarquia de títulos e tabelas.
+- **Extração**: PDFs textuais continuam usando PyMuPDF4LLM. Em PDFs de aula
+  com alta cobertura de imagem e pouco texto nativo, PyMuPDF ordena blocos de
+  texto e imagem pelas coordenadas, funde tiras adjacentes e mantém a figura
+  no local correto do Markdown.
 - **OCR automático, mas controlado por nós.** O pymupdf4llm ≥1.28 vem com
   um classificador automático (ONNX) que decide sozinho quando rodar OCR --
   e ele erra especificamente em páginas que misturam uma imagem grande
   (capa, logo) com bastante texto nativo: classifica a página inteira como
   "escaneada" e o OCR *substitui* o texto nativo real, apagando conteúdo em
   silêncio. Por isso o docintel desativa esse classificador
-  (`pymupdf4llm.use_layout(False)`) e faz a própria checagem, simples e
-  auditável: só roda OCR manualmente nas páginas onde o PyMuPDF não
-  encontra texto nativo nenhum (ou seja, páginas genuinamente escaneadas).
-  Páginas com texto digital nunca são tocadas por OCR, então nunca correm
-  o risco de ter conteúdo apagado.
+  (`pymupdf4llm.use_layout(False)`) e faz a própria checagem: no pipeline
+  textual, OCR manual só roda nas páginas sem texto nativo; no pipeline
+  visual, OCR das figuras é apresentado apenas em callout recolhido para
+  busca, sem substituir a imagem nem entrar como corpo do enunciado.
+- **Símbolos lógicos**: variantes ASCII/OCR são normalizadas para Unicode
+  somente em contexto de fórmula (por exemplo, `P v Q` → `P ∨ Q`, `P > Q` →
+  `P ⇒ Q`, `P = Q` → `P ⇔ Q`). Letras `v`, `A` e símbolos semelhantes na
+  prosa não são substituídos fora desse contexto.
+- **Rodapés**: a faixa inferior (7% da página) é ignorada na extração visual;
+  URLs/domínios reconhecidos são removidos inclusive quando têm espaços ou
+  erros comuns de OCR. Links legítimos no corpo são preservados.
 - **Progresso real de upload**: a interface mostra o envio byte a byte (não
   é só um spinner) — se a barra não andar, o problema é de rede/conexão; se
   andar até 100% e o job aparecer como "processando", o envio funcionou e
@@ -150,24 +165,29 @@ o que é pior que deixar em branco pra você revisar manualmente.
 ## Baixando o resultado
 
 Além de apontar o Obsidian direto pra pasta `output/`, cada job concluído
-tem um botão "baixar .zip" que empacota o `.md` e as imagens da nota num
-único arquivo. Em navegadores baseados em Chromium (Chrome, Edge), isso
+tem um botão "baixar .zip" que empacota o `.md`, as imagens e o PDF original
+num único arquivo. O seletor acima da fila permite escolher a compressão do
+PDF: **Menor**, **Média** (padrão) ou **Maior**. Em navegadores baseados em
+Chromium (Chrome, Edge), isso
 abre o diálogo nativo de "salvar como", deixando você escolher a pasta; em
 outros navegadores, cai no download padrão configurado no próprio navegador
 — isso é uma limitação da web, não tem como um site forçar esse diálogo em
 todo navegador.
 
-As imagens dentro do zip (e também na pasta `output/`) seguem uma numeração
-auditável: `<nome-do-pdf>-img<N>-pg<página>.png` — por exemplo, a 2ª imagem
-extraída, que está na página 2, vira `DCA1-img2-pg2.png`. A numeração é
-sequencial e global (segue a ordem em que as imagens aparecem no documento),
-a página é a página real do PDF de origem.
+As imagens dentro do zip (e também na pasta `output/`) usam o nome do PDF
+enviado. Para páginas visuais, o padrão é
+`<nome-do-pdf>-pg<página>-fig<N>.png`; no pipeline textual legado, as imagens
+continuam usando `<nome-do-pdf>-img<N>-pg<página>.png`.
 
 ## Ajustes
 
 - `DOCINTEL_WORKERS` (docker-compose.yml): quantas conversões rodar em
   paralelo. OCR usa 1 core inteiro por página em picos — comece em 2 e suba
   aos poucos observando o uso de CPU do servidor.
+- O recorte de marca d'água (`--crop-watermark`) é opcional e fica desligado
+  por padrão. Para uma execução manual do worker, acrescente a flag ao final:
+  `python worker_convert.py <pdf> <diretorio-de-saida> <meta.json> <resultado.json> --crop-watermark`.
+  A interface web não ativa esse recorte.
 - Para processar milhares de apostilas de uma vez, é só selecionar todas no
   seletor de arquivos (ou arrastar a pasta inteira) — a fila absorve o lote
   e processa uma a uma sem bloquear a interface.

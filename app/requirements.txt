@@ -3,3 +3,4 @@ uvicorn[standard]==0.32.1
 python-multipart==0.0.20
 pymupdf==1.28.0
 pymupdf4llm==1.28.0
+Pillow==10.2.0

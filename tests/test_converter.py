@@ -1,6 +1,9 @@
 import os
+import io
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 import converter
@@ -89,6 +92,133 @@ G7JURIDICO<br><!-- End of picture text -->
         self.assertNotIn("end of page", out)
         self.assertIn("-Conteúdo da última página.", out)
 
+    def test_normalizar_simbolos_logicos_apenas_em_contexto_de_formula(self):
+        raw = "P^Q v R -> ~S; palavra ou texto comum; v sozinho; ^ símbolo"
+        out = converter._normalizar_simbolos_logicos(raw)
+        self.assertIn("P ∧ Q ∨ R → ¬S", out)
+        self.assertIn("palavra ou texto comum; v sozinho; ^ símbolo", out)
+        self.assertEqual(
+            converter._normalizar_simbolos_logicos("P <-> Q; P <=> Q; P => Q"),
+            "P ↔ Q; P ⇔ Q; P ⇒ Q",
+        )
+        self.assertEqual(
+            converter._normalizar_simbolos_logicos("condicional P ? Q\nconjunção A\ue001B"),
+            "condicional P → Q\nconjunção A∧B",
+        )
+        self.assertEqual(
+            converter._normalizar_simbolos_logicos(
+                "bicondicional P\ue001Q\nimply\nimplicação A?B\nnão pertence C?D"
+            ),
+            "bicondicional P↔Q\nimply\nimplicação A ⇒ B\nnão pertence C ∉ D",
+        )
+        self.assertEqual(
+            converter._normalizar_simbolos_logicos("(P V Q) A R; p v q; palavra comum"),
+            "(P ∨ Q) ∧ R; p ∨ q; palavra comum",
+        )
+        self.assertEqual(
+            converter._normalizar_simbolos_logicos("CASO A QUESTAO; P A Q"),
+            "CASO A QUESTAO; P ∧ Q",
+        )
+        self.assertEqual(
+            converter._normalizar_simbolos_logicos("P > Q; P = Q"),
+            "P ⇒ Q; P ⇔ Q",
+        )
+        self.assertEqual(
+            converter._normalizar_simbolos_logicos("A questão P ? Q"),
+            "A questão P ? Q",
+        )
+
+    def test_converter_pdf_normaliza_formula_e_remove_site_na_faixa_inferior(self):
+        import pymupdf
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = os.path.join(temp_dir, "logica.pdf")
+            doc = pymupdf.open()
+            page = doc.new_page(width=595, height=842)
+            page.insert_text((50, 100), "P^Q v R -> ~S; P <-> Q", fontsize=14)
+            page.insert_text((50, 160), "Link legítimo: https://exemplo.com.br/lei", fontsize=12)
+            page.insert_text((420, 820), "WWW . EXEMPLO . COM . BR", fontsize=10)
+            doc.save(pdf_path)
+            doc.close()
+
+            result = converter.convert_pdf(
+                pdf_path,
+                os.path.join(temp_dir, "output"),
+                {"slug": "logica", "display_name": "logica"},
+            )
+            with open(result["md_path"], encoding="utf-8") as markdown_file:
+                markdown = markdown_file.read()
+
+        self.assertIn("P ∧ Q ∨ R → ¬S; P ↔ Q", markdown)
+        self.assertNotIn("EXEMPLO", markdown)
+        self.assertIn("https://exemplo.com.br/lei", markdown)
+
+    def test_visual_extraction_merges_adjacent_strips_and_uses_current_stem(self):
+        import pymupdf
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = os.path.join(temp_dir, "source.pdf")
+            doc = pymupdf.open()
+            page = doc.new_page(width=400, height=500)
+            page.insert_text((40, 60), "ROTEIRO DE AULA", fontname="hebo", fontsize=14)
+            image = Image.new("RGB", (300, 100), "white")
+            image_buffer = io.BytesIO()
+            image.save(image_buffer, format="PNG")
+            page.insert_image(pymupdf.Rect(40, 150, 340, 250), stream=image_buffer.getvalue())
+            page.insert_image(pymupdf.Rect(40, 250, 340, 350), stream=image_buffer.getvalue())
+            doc.save(pdf_path)
+            doc.close()
+
+            result = converter.convert_pdf(
+                pdf_path,
+                os.path.join(temp_dir, "output"),
+                {"slug": "source", "display_name": "Current_Stem"},
+            )
+            with open(result["md_path"], encoding="utf-8") as markdown_file:
+                markdown = markdown_file.read()
+
+            image_path = os.path.join(temp_dir, "output", "images", "Current_Stem-pg1-fig1.png")
+            self.assertTrue(os.path.isfile(image_path))
+            with Image.open(image_path) as merged:
+                self.assertEqual(merged.size, (300, 200))
+
+        self.assertEqual(result["n_images"], 1)
+        self.assertIn("# ROTEIRO DE AULA", markdown)
+        self.assertLess(markdown.index("# ROTEIRO DE AULA"), markdown.index("![[Current_Stem-pg1-fig1.png]]"))
+        self.assertNotIn("[[ROTEIRO DE AULA]]", markdown)
+
+    def test_crop_watermark_is_disabled_by_default_and_explicit_when_requested(self):
+        import pymupdf
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = os.path.join(temp_dir, "watermark.pdf")
+            doc = pymupdf.open()
+            page = doc.new_page(width=400, height=500)
+            image = Image.new("RGB", (300, 200), "white")
+            image_buffer = io.BytesIO()
+            image.save(image_buffer, format="PNG")
+            page.insert_image(pymupdf.Rect(40, 150, 340, 350), stream=image_buffer.getvalue())
+            doc.save(pdf_path)
+            doc.close()
+
+            with patch.object(converter, "_ocr_figura", return_value="WWW.G7JURIDICO.COM.BR"):
+                default_dir = os.path.join(temp_dir, "default")
+                converter.convert_pdf(pdf_path, default_dir, {"slug": "watermark", "display_name": "watermark"})
+                crop_dir = os.path.join(temp_dir, "crop")
+                converter.convert_pdf(
+                    pdf_path,
+                    crop_dir,
+                    {"slug": "watermark", "display_name": "watermark"},
+                    crop_watermark=True,
+                )
+
+            with Image.open(os.path.join(default_dir, "images", "watermark-pg1-fig1.png")) as default_image:
+                self.assertEqual(default_image.size, (300, 200))
+            with Image.open(os.path.join(crop_dir, "images", "watermark-pg1-fig1.png")) as cropped_image:
+                self.assertEqual(cropped_image.size, (282, 188))
+
 
 class ApostilaOnlyTests(unittest.TestCase):
     """Testes das funções exclusivas do pipeline de apostila (adicionadas
@@ -169,21 +299,29 @@ class ApostilaOnlyTests(unittest.TestCase):
             "Texto normal do corpo da aula."
         )
         out = converter._processar_indice(md)
-        self.assertIn("- [[Sumário]]", out)
-        self.assertIn("- [[Controle de constitucionalidade]]", out)
-        self.assertIn("  - [[1- Teoria Geral]]", out)
+        self.assertIn("# Sumário", out)
+        self.assertIn("#### Controle de constitucionalidade", out)
+        self.assertIn("##### 1- Teoria Geral", out)
+        self.assertNotIn("[[Sumário]]", out)
+        self.assertNotIn("[[Controle de constitucionalidade]]", out)
         # não mexe no que vem depois do índice
         self.assertIn("![[capa.png]]", out)
         self.assertIn("Texto normal do corpo da aula.", out)
 
     def test_formatar_bloco_assunto_nests_dotted_outline(self):
-        linhas = ["3. Poder Executivo", "3.1 exercício do poder executivo", "3. 6 Imunidades do Presidente"]
+        linhas = [
+            "3. Poder Executivo",
+            "3.1 exercício do poder executivo",
+            "3. 6 Imunidades do Presidente",
+            "3.1.2 Competências",
+        ]
         out = converter._formatar_bloco_assunto(linhas)
         self.assertEqual(
             out,
-            "- [[3. Poder Executivo]]\n"
-            "  - [[3.1 exercício do poder executivo]]\n"
-            "  - [[3.6 Imunidades do Presidente]]",
+            "# 3. Poder Executivo\n"
+            "#### 3.1 exercício do poder executivo\n"
+            "#### 3.6 Imunidades do Presidente\n"
+            "##### 3.1.2 Competências",
         )
 
     def test_alerta_callout_wraps_obs_with_leading_bullet_dash(self):
@@ -256,11 +394,26 @@ class ApostilaOnlyTests(unittest.TestCase):
         self.assertNotIn("⮚", out)
         self.assertIn("- O Poder Executivo pode se estruturar.", out)
 
-    def test_remover_sites_residuais_strips_url_glued_mid_paragraph(self):
-        raw = "-Veja que NÃO é a autorização da Câmara 35 www.g7juridico.com.br"
+    def test_remover_sites_residuais_strips_footer_but_preserves_inline_links(self):
+        raw = (
+            "Veja o material em https://exemplo.com.br/documento.\n"
+            "-Veja que NÃO é a autorização da Câmara 35 WWW . G7JURIDICO . COM . BR"
+        )
         out = converter._remover_sites_residuais(raw)
-        self.assertNotIn("www.g7juridico.com.br", out)
+        self.assertNotIn("G7JURIDICO", out)
         self.assertNotIn(" 35 ", out)
+        self.assertIn("https://exemplo.com.br/documento", out)
+
+    def test_remover_sites_residuais_strips_standalone_domain(self):
+        out = converter._remover_sites_residuais("Texto útil.\nwww.exemplo.com.br\nMais texto.")
+        self.assertNotIn("www.exemplo.com.br", out)
+        self.assertIn("Texto útil.", out)
+        self.assertIn("Mais texto.", out)
+
+    def test_remover_sites_residuais_handles_ocr_digit_and_spacing_noise(self):
+        out = converter._remover_sites_residuais("www.g/7juridico.com.br\nWWW . G7JURIDICO . COM . BR")
+        self.assertNotIn("juridico", out.lower())
+        self.assertNotIn("www", out.lower())
 
 
 if __name__ == "__main__":

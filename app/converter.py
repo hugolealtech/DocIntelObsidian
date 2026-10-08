@@ -34,13 +34,16 @@ Por isso aqui é feito o oposto do que a lib faz por padrão:
 
 import datetime
 import hashlib
+import io
 import os
 import re
+import subprocess
 import sys
 import unicodedata
 
 import pymupdf
 import pymupdf4llm
+from PIL import Image
 
 # Desativa o motor de layout/OCR automático baseado em ONNX (ver docstring
 # do módulo). Precisa rodar antes de qualquer chamada de to_markdown().
@@ -96,9 +99,10 @@ _HTML_COMMENT_RE = re.compile(r"(?is)<!--.*?-->")
 # renderizada como imagem), o pymupdf4llm emite o embed da imagem DEPOIS do
 # rodapé no texto, então o rodapé não fica necessariamente no fim do bloco.
 _FOOTER_RE = re.compile(
-    r"\n{1,}(?P<pagenum>\d{1,4})\n"
-    r"(?P<url>(?:https?://)?(?:www\.)?[A-Za-z0-9][A-Za-z0-9\-]*(?:\.[A-Za-z0-9\-]+)+(?:/\S*)?)"
-    r"(?=\n|$)"
+    r"(?im)\n{1,}(?P<pagenum>\d{1,4})[ \t]*\n"
+    r"[ \t]*(?P<url>(?:(?:https?\s*:\s*/\s*/)|(?:w\s*w\s*w\s*\.\s*))?"
+    r"[A-Za-z0-9][A-Za-z0-9\-]*(?:\s*\.\s*[A-Za-z0-9\-]+)+(?:\s*/\s*\S*)?)"
+    r"[.,;:!?)]*(?=[ \t]*(?:\n|$))"
 )
 
 # --- Reflow de parágrafos ---------------------------------------------------
@@ -628,7 +632,7 @@ def process_pages_apostila(md_text: str, ancoras_por_pagina: dict = None) -> tup
 # uma indentação abaixo) -- é essa hierarquia visual que replicamos aqui
 # como lista aninhada, com cada item virando um wikilink do Obsidian.
 _INDICE_HEADING_RE = re.compile(r"^\*\*([^*]+?)\*\*:?$")
-_INDICE_CHILD_DOTNUM_RE = re.compile(r"^(\d{1,3})\.\s*(\d{1,3})\s+(\S.*)$")
+_INDICE_CHILD_DOTNUM_RE = re.compile(r"^(\d{1,3}(?:\.\s*\d{1,3})+)\s+(\S.*)$")
 _INDICE_PARENT_NUM_RE = re.compile(r"^(\d{1,3})\.\s+([A-Za-zÀ-ÖØ-öø-ÿ].*)$")
 _INDICE_CHILD_DASH_RE = re.compile(r"^(\d{1,3})\s*[-–—]\s*(\S.*)$")
 
@@ -650,7 +654,9 @@ def _classificar_linha_indice(linha: str):
         return (0, m.group(1).strip())
     m = _INDICE_CHILD_DOTNUM_RE.match(linha)
     if m:
-        return (1, f"{m.group(1)}.{m.group(2)} {m.group(3)}".strip())
+        nivel = min(m.group(1).count("."), 2)
+        numero = re.sub(r"\s*\.\s*", ".", m.group(1))
+        return (nivel, f"{numero} {m.group(2)}".strip())
     m = _INDICE_PARENT_NUM_RE.match(linha)
     if m:
         return (0, f"{m.group(1)}. {m.group(2)}".strip())
@@ -660,12 +666,13 @@ def _classificar_linha_indice(linha: str):
     return None
 
 
-def _formatar_item_indice(texto: str) -> str:
+def _formatar_item_indice(texto: str, nivel: int = 0) -> str:
     texto = texto.strip().rstrip(":").strip()
     texto = re.sub(r"^\*\*|\*\*$", "", texto).strip()
     if not texto:
         return ""
-    return f"[[{texto}]]"
+    nivel_heading = (1, 4, 5)[min(nivel, 2)]
+    return f"{'#' * nivel_heading} {texto}"
 
 
 def _formatar_bloco_assunto(linhas: list) -> str:
@@ -677,11 +684,9 @@ def _formatar_bloco_assunto(linhas: list) -> str:
     for linha in linhas:
         classificado = _classificar_linha_indice(linha) or (0, linha)
         nivel, texto = classificado
-        link = _formatar_item_indice(texto)
-        if not link:
-            continue
-        prefixo = "  - " if nivel else "- "
-        saida.append(f"{prefixo}{link}")
+        heading = _formatar_item_indice(texto, nivel)
+        if heading:
+            saida.append(heading)
     return "\n".join(saida)
 
 
@@ -721,12 +726,11 @@ def _processar_indice(md_text: str) -> str:
         return md_text
 
     linhas_saida = []
-    for nivel, texto in itens:
-        link = _formatar_item_indice(texto)
-        if not link:
-            continue
-        prefixo = "  - " if nivel else "- "
-        linhas_saida.append(f"{prefixo}{link}")
+    for indice, (nivel, texto) in enumerate(itens):
+        nivel_heading = 0 if indice == 0 else (1 if nivel == 0 else min(nivel + 1, 2))
+        heading = _formatar_item_indice(texto, nivel_heading)
+        if heading:
+            linhas_saida.append(heading)
 
     partes = []
     if preambulo:
@@ -889,16 +893,432 @@ def _aplicar_callouts_alerta(md_text: str) -> str:
 # saem colados ao parágrafo anterior na extração), a URL do site sobra
 # solta no meio do texto. Isso roda como último passo, sobre o documento
 # inteiro já reformatado, como rede de segurança.
-_SITE_RESIDUAL_RE = re.compile(
-    r"[ \t]*\b\d{1,4}\b(?=[ \t]+(?:https?://|www\.))"
-    r"|https?://\S+"
-    r"|\bwww\.[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+(?:/\S*)?"
+_SITE_TOKEN_PATTERN = (
+    r"(?:(?:https?\s*:\s*/\s*/\s*)\S+|"
+    r"(?:w\s*w\s*w[\s.]*[A-Za-z0-9][A-Za-z0-9/\-]*|"
+    r"[A-Za-z0-9][A-Za-z0-9/\-]*)(?:\s*\.\s*[A-Za-z0-9][A-Za-z0-9/\-]*)+)"
+)
+_SITE_TOKEN_RE = re.compile(_SITE_TOKEN_PATTERN, re.IGNORECASE)
+_SITE_ONLY_LINE_RE = re.compile(
+    rf"(?i)^\s*{_SITE_TOKEN_PATTERN}\s*[.,;:!?)]*\s*$"
+)
+_FOOTER_PAGE_NUMBER_RE = re.compile(r"(?i)[ \t]\b\d{1,4}\b[ \t]+$")
+
+# Uma única tabela de equivalências para notação ASCII comum em fórmulas.
+# Aplicada somente a linhas com estrutura de proposição matemática.
+_LOGICAL_SYMBOL_MAP = {
+    "<->": "↔",
+    "<=>": "⇔",
+    "—»": "→",
+    "—>": "→",
+    "->": "→",
+    "-o": "→",
+    "=>": "⇒",
+    "<>": "≠",
+    "!=": "≠",
+    "<=": "≤",
+    ">=": "≥",
+    "==": "≡",
+    ">": "⇒",
+    "=": "⇔",
+    "se e somente se": "↔",
+    "não está contido": "⊈",
+    "não contém ou é igual": "⊉",
+    "não pertence": "∉",
+    "não contido": "⊄",
+    "não contém": "⊅",
+    "contido ou igual": "⊆",
+    "contém ou igual": "⊇",
+    "quantificador universal": "∀",
+    "menor ou igual": "≤",
+    "maior ou igual": "≥",
+    "ou exclusivo": "⊻",
+    "bicondicional": "↔",
+    "equivalência": "⇔",
+    "equivalente": "⇔",
+    "implicação": "⇒",
+    "condicional": "→",
+    "conjunção": "∧",
+    "disjunção": "∨",
+    "negação": "¬",
+    "subconjunto": "⊆",
+    "superconjunto": "⊇",
+    "contido": "⊂",
+    "contém": "⊃",
+    "pertence": "∈",
+    "vazio": "∅",
+    "união": "∪",
+    "interseção": "∩",
+    "não existe": "∄",
+    "para todo": "∀",
+    "diferente": "≠",
+    "portanto": "∴",
+    "porque": "∵",
+    "infinito": "∞",
+    "naturais": "ℕ",
+    "inteiros": "ℤ",
+    "racionais": "ℚ",
+    "reais": "ℝ",
+    "not exists": "∄",
+    "forall": "∀",
+    "exists": "∃",
+    "~": "¬",
+    "A": "∧",
+    "^": "∧",
+    "v": "∨",
+    "V": "∨",
+}
+_LOGICAL_ASCII_RE = re.compile(r"<->|<=>|—»|—>|->|-o|=>|<>|!=|<=|>=|==|~")
+_LOGICAL_WORD_OPERATORS_RE = re.compile(r"(?i)\b(not\s+exists|forall|exists)\b")
+_LOGICAL_CONTEXT_WORD_RE = re.compile(
+    r"(?i)\b(?:"
+    + "|".join(
+        re.escape(word)
+        for word in sorted(
+            (
+                key for key in _LOGICAL_SYMBOL_MAP
+                if len(key) > 1 and re.search(r"[A-Za-zÀ-ÿ]", key)
+            ),
+            key=len,
+            reverse=True,
+        )
+    )
+    + r")\b"
+)
+_LOGICAL_UNKNOWN_OPERATOR_RE = re.compile(r"(?<=[A-Za-z(~])\s*\?\s*(?=[A-Za-z)])")
+_LOGICAL_CONNECTIVE_CONTEXT_RE = re.compile(
+    r"(?:[A-Za-z0-9)]|~)(?:\s*\^\s*|\s+[vVA]\s+)(?:[A-Za-z(]|~)"
+)
+_LOGICAL_OPERATOR_CONTEXT_RE = re.compile(
+    r"(?:[A-Za-z)]|~)\s*(?:<->|<=>|—»|—>|->|-o|=>|<>|!=|<=|>=|==|>|=)\s*(?:[A-Za-z(]|~)"
+)
+_LOGICAL_AND_A_CONTEXT_RE = re.compile(
+    r"(?P<left>(?:(?<![A-Za-z0-9])[A-Za-z](?![A-Za-z0-9])|\)))\s+A\s+"
+    r"(?P<right>(?:(?<![A-Za-z0-9])[A-Za-z](?![A-Za-z0-9])|\())"
+)
+_LOGICAL_V_CONTEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?P<left>[A-Za-z]|\))\s+(?P<operator>[vV])\s+"
+    r"(?P<right>[A-Za-z]|\()(?![A-Za-z0-9])"
+)
+_LOGICAL_CARET_CONTEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?P<left>[A-Za-z]|\))\s*(?P<operator>\^)\s*"
+    r"(?P<right>[A-Za-z]|\()(?![A-Za-z0-9])"
+)
+_LOGICAL_SINGLE_OPERATOR_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?P<left>[A-Za-z]|\))\s*(?P<operator>[>=])\s*"
+    r"(?P<right>[A-Za-z]|\()(?![A-Za-z0-9])"
+)
+_LOGICAL_LINE_CONTEXT_RE = re.compile(
+    r"(?:<->|<=>|—»|—>|->|-o|=>|<>|!=|<=|>=|==|[¬~≡↔→⇒⇔∧∨⊻⊕∈∉⊂⊆⊄⊈⊃⊇⊅⊉∅∪∩∀∃∄≠≤≥∴∵∞ℕℤℚℝ])"
 )
 
 
+def _normalizar_simbolos_logicos(md_text: str) -> str:
+    """Normaliza notação ASCII de fórmulas sem substituir letras em prosa."""
+    saida = []
+    for linha in md_text.splitlines(keepends=True):
+        conteudo = linha.rstrip("\r\n")
+        terminador = linha[len(conteudo):]
+        glifos_privados = []
+        for indice, caractere in enumerate(conteudo):
+            anterior = conteudo[:indice].rstrip()
+            proximo = conteudo[indice + 1:].lstrip()
+            if (
+                unicodedata.category(caractere) == "Co"
+                and anterior and proximo
+                and anterior[-1] in "ABCDEFGHIJKLMNOPQRSTUVWXYZ)"
+                and proximo[0] in "ABCDEFGHIJKLMNOPQRSTUVWXYZ("
+            ):
+                glifos_privados.append(indice)
+        contexto_logico = bool(
+            _LOGICAL_LINE_CONTEXT_RE.search(conteudo)
+            or _LOGICAL_CONNECTIVE_CONTEXT_RE.search(conteudo)
+            or _LOGICAL_OPERATOR_CONTEXT_RE.search(conteudo)
+            or _LOGICAL_AND_A_CONTEXT_RE.search(conteudo)
+            or _LOGICAL_V_CONTEXT_RE.search(conteudo)
+            or _LOGICAL_CARET_CONTEXT_RE.search(conteudo)
+            or _LOGICAL_UNKNOWN_OPERATOR_RE.search(conteudo)
+            or glifos_privados
+            or _LOGICAL_CONTEXT_WORD_RE.search(conteudo)
+            or re.search(r"\b(?:lógica|proposição)\b", conteudo, re.I)
+        )
+        if contexto_logico:
+            operadores_desconhecidos = list(_LOGICAL_UNKNOWN_OPERATOR_RE.finditer(conteudo))
+            pistas = list(_LOGICAL_CONTEXT_WORD_RE.finditer(conteudo))
+            pista = max(pistas, key=lambda match: len(match.group(0)), default=None)
+            operador_semantico = _LOGICAL_SYMBOL_MAP.get(pista.group(0).lower()) if pista else None
+            desconhecidos = [
+                (match.start(), match.end(), f" {operador_semantico} ")
+                for match in operadores_desconhecidos
+            ] + [
+                (indice, indice + 1, operador_semantico)
+                for indice in glifos_privados
+            ]
+            if operador_semantico and len(desconhecidos) == 1:
+                inicio, fim, substituto = desconhecidos[0]
+                conteudo = conteudo[:inicio] + substituto + conteudo[fim:]
+            conteudo = _LOGICAL_ASCII_RE.sub(
+                lambda m: _LOGICAL_SYMBOL_MAP[m.group(0)], conteudo
+            )
+            conteudo = _LOGICAL_SINGLE_OPERATOR_RE.sub(
+                lambda m: (
+                    f"{m.group('left')} {_LOGICAL_SYMBOL_MAP[m.group('operator')]} "
+                    f"{m.group('right')}"
+                ),
+                conteudo,
+            )
+            conteudo = _LOGICAL_WORD_OPERATORS_RE.sub(
+                lambda m: _LOGICAL_SYMBOL_MAP[m.group(0).lower()], conteudo
+            )
+            conteudo = _LOGICAL_AND_A_CONTEXT_RE.sub(
+                lambda m: f"{m.group('left')} {_LOGICAL_SYMBOL_MAP['A']} {m.group('right')}", conteudo
+            )
+            conteudo = _LOGICAL_V_CONTEXT_RE.sub(
+                lambda m: (
+                    f"{m.group('left')} {_LOGICAL_SYMBOL_MAP[m.group('operator')]} "
+                    f"{m.group('right')}"
+                ),
+                conteudo,
+            )
+            conteudo = _LOGICAL_CARET_CONTEXT_RE.sub(
+                lambda m: (
+                    f"{m.group('left')} {_LOGICAL_SYMBOL_MAP[m.group('operator')]} "
+                    f"{m.group('right')}"
+                ),
+                conteudo,
+            )
+        saida.append(conteudo + terminador)
+    return "".join(saida)
+
+
 def _remover_sites_residuais(texto: str) -> str:
-    """Ver docstring da seção acima."""
-    return _SITE_RESIDUAL_RE.sub("", texto)
+    """Remove URLs isoladas e rodapés de site repetidos, preservando links
+    incorporados ao texto corrido do corpo."""
+    linhas = texto.splitlines()
+    ocorrencias = {}
+    pagina_atual = 0
+    for linha in linhas:
+        if re.fullmatch(r"\*p\. \d+\*", linha.strip()):
+            pagina_atual += 1
+        for match in _SITE_TOKEN_RE.finditer(linha):
+            normalizado = re.sub(r"\s*\.\s*", ".", match.group(0)).lower().rstrip(".,;:!?)")
+            ocorrencias.setdefault(normalizado, set()).add(pagina_atual)
+
+    resultado = []
+    for linha in linhas:
+        if _SITE_ONLY_LINE_RE.fullmatch(linha):
+            continue
+        estado = {"remover_numero_pagina": False}
+
+        def remover_rodape(match):
+            inicio, fim = match.span()
+            prefixo = linha[:inicio]
+            sufixo = linha[fim:]
+            normalizado = re.sub(r"\s*\.\s*", ".", match.group(0)).lower().rstrip(".,;:!?)")
+            tem_numero_pagina = bool(_FOOTER_PAGE_NUMBER_RE.search(prefixo))
+            eh_final_de_linha = not sufixo.strip(" \t.,;:!?)")
+            repetido = len(ocorrencias.get(normalizado, set())) >= 3
+            if eh_final_de_linha and (tem_numero_pagina or repetido):
+                estado["remover_numero_pagina"] = tem_numero_pagina
+                return ""
+            return match.group(0)
+
+        limpa = _SITE_TOKEN_RE.sub(remover_rodape, linha)
+        if estado["remover_numero_pagina"]:
+            limpa = _FOOTER_PAGE_NUMBER_RE.sub("", limpa)
+        resultado.append(limpa)
+    final = "\n".join(resultado)
+    return final + ("\n" if texto.endswith("\n") else "")
+
+
+def _sites_no_rodape_pdf(doc: "pymupdf.Document") -> dict:
+    """Encontra domínios na faixa inferior das páginas nativas do PDF."""
+    sites_por_pagina = {}
+    for page in doc:
+        sites = []
+        limite_superior_rodape = page.rect.height * 0.86
+        for bloco in page.get_text("dict").get("blocks", []):
+            for linha in bloco.get("lines", []):
+                if linha.get("bbox", (0, 0, 0, 0))[1] < limite_superior_rodape:
+                    continue
+                texto_linha = "".join(span.get("text", "") for span in linha.get("spans", []))
+                for match in _SITE_TOKEN_RE.finditer(texto_linha):
+                    site = re.sub(r"\s*\.\s*", ".", match.group(0)).lower().strip(".,;:!?) ")
+                    sites.append(site)
+        if sites:
+            sites_por_pagina[page.number] = sites
+    return sites_por_pagina
+
+
+def _remover_sites_por_posicao(md_text: str, sites_por_pagina: dict) -> str:
+    """Remove a ocorrência do domínio extraído na faixa de rodapé da página."""
+    if not sites_por_pagina:
+        return md_text
+    partes = _PAGE_SEP_RE.split(md_text)
+    for i in range(0, len(partes) - 1, 2):
+        pagina = int(partes[i + 1])
+        conteudo = partes[i]
+        for site in sites_por_pagina.get(pagina, []):
+            ocorrencias = [
+                match for match in _SITE_TOKEN_RE.finditer(conteudo)
+                if re.sub(r"\s*\.\s*", ".", match.group(0)).lower().strip(".,;:!?) ") == site
+            ]
+            if ocorrencias:
+                match = ocorrencias[-1]
+                conteudo = conteudo[:match.start()] + conteudo[match.end():]
+        partes[i] = conteudo
+    saida = []
+    for i, parte in enumerate(partes):
+        if i % 2 == 1:
+            saida.append(f"\n\n--- end of page={parte} ---\n\n")
+        else:
+            saida.append(parte)
+    return "".join(saida)
+
+
+def _ocr_figura(image: Image.Image) -> str:
+    """Executa OCR de busca sobre a figura, sem promovê-lo a texto principal."""
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    try:
+        result = subprocess.run(
+            ["tesseract", "stdin", "stdout", "-l", "por+eng", "--psm", "6"],
+            input=buffer.getvalue(), capture_output=True, timeout=45, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.decode("utf-8", errors="replace").strip() if result.returncode == 0 else ""
+
+
+def _limpar_ocr_site(texto: str) -> str:
+    linhas = []
+    for linha in texto.splitlines():
+        if _SITE_ONLY_LINE_RE.fullmatch(linha.strip()):
+            continue
+        if re.fullmatch(r"(?i)\s*(?:[A-Z0-9]{1,4}\s+)?JUR[ií]DICO\s*", linha):
+            continue
+        limpa = _SITE_TOKEN_RE.sub("", linha).strip()
+        if limpa:
+            linhas.append(limpa)
+    return "\n".join(linhas)
+
+
+def _texto_linha_pdf(line: dict, titulo_state: dict) -> str:
+    spans = line.get("spans", [])
+    texto = "".join(span.get("text", "") for span in spans).strip()
+    if not texto:
+        return ""
+    spans_visiveis = [span for span in spans if span.get("text", "").strip()]
+    negrito = bool(spans_visiveis) and all(span.get("flags", 0) & 16 for span in spans_visiveis)
+    if not negrito:
+        return texto
+
+    titulo = re.sub(r"\s+", " ", texto).strip()
+    normalizado = titulo.casefold()
+    if normalizado == "roteiro de aula":
+        titulo_state["principal"] = True
+        return f"# {titulo}"
+    numeracao = re.match(r"^(\d+(?:\.\d+)*)(?:[.)])?\s+", titulo)
+    if numeracao:
+        profundidade = numeracao.group(1).count(".")
+        nivel = 1 if profundidade == 0 else (4 if profundidade == 1 else 5)
+        titulo_state["principal"] = True
+        return f"{'#' * nivel} {titulo}"
+    if re.fullmatch(r"bloco\s+\d+", normalizado):
+        return f"#### {titulo}"
+    if titulo_state["principal"] and (
+        normalizado.startswith("lógica proposicional")
+        or titulo.isupper()
+    ):
+        return f"#### {titulo}"
+    return f"**{texto}**"
+
+
+def _extrair_layout_pdf(
+    input_path: str,
+    img_dir: str,
+    stem: str,
+    crop_watermark: bool = False,
+) -> tuple:
+    """Extrai texto e imagens por posição; tiras adjacentes viram uma figura."""
+    paginas = []
+    with pymupdf.open(input_path) as doc:
+        for page in doc:
+            page_dict = page.get_text("dict")
+            blocos = page_dict.get("blocks", [])
+            imagens = sorted(
+                (block for block in blocos if block.get("type") == 1 and block.get("image")),
+                key=lambda block: (block["bbox"][1], block["bbox"][0]),
+            )
+            grupos = []
+            for block in imagens:
+                bbox = block["bbox"]
+                if grupos:
+                    anterior = grupos[-1][-1]["bbox"]
+                    mesma_largura = abs((anterior[2] - anterior[0]) - (bbox[2] - bbox[0])) <= 1
+                    mesma_coluna = abs(anterior[0] - bbox[0]) <= 1
+                    adjacente = abs(anterior[3] - bbox[1]) <= 3
+                    if mesma_largura and mesma_coluna and adjacente:
+                        grupos[-1].append(block)
+                        continue
+                grupos.append([block])
+
+            eventos = []
+            titulo_state = {"principal": False}
+            for block in blocos:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    bbox = line.get("bbox", block.get("bbox", (0, 0, 0, 0)))
+                    if bbox[1] >= page.rect.height * 0.93:
+                        continue
+                    text = _texto_linha_pdf(line, titulo_state)
+                    if text:
+                        eventos.append((bbox[1], bbox[0], "texto", text))
+
+            for indice, grupo in enumerate(grupos, start=1):
+                partes = [Image.open(io.BytesIO(block["image"])).convert("RGB") for block in grupo]
+                largura = max(parte.width for parte in partes)
+                partes = [
+                    parte.resize((largura, max(1, round(parte.height * largura / parte.width))))
+                    if parte.width != largura else parte
+                    for parte in partes
+                ]
+                figura = Image.new("RGB", (largura, sum(parte.height for parte in partes)), "white")
+                y = 0
+                for parte in partes:
+                    figura.paste(parte, (0, y))
+                    y += parte.height
+
+                ocr = _ocr_figura(figura)
+                if crop_watermark and re.search(r"(?i)(?:www|jur[ií]dico|\.com\.?br)", ocr):
+                    figura = figura.crop((0, 0, max(1, int(figura.width * 0.94)), max(1, int(figura.height * 0.94))))
+
+                page_number = page.number + 1
+                filename = f"{stem}-pg{page_number}-fig{indice}.png"
+                figura.save(os.path.join(img_dir, filename), format="PNG")
+                figure_block = f"![[{filename}]]"
+                ocr = _limpar_ocr_site(ocr)
+                ocr = _normalizar_simbolos_logicos(ocr).strip()
+                if len(ocr) >= 4:
+                    ocr_block = "> [!note]- Texto OCR (aproximado)\n" + "\n".join(
+                        f"> {line}" for line in ocr.splitlines() if line.strip()
+                    )
+                    figure_block += "\n\n" + ocr_block
+                bbox = grupo[0]["bbox"]
+                eventos.append((bbox[1], bbox[0], "imagem", figure_block))
+
+            eventos.sort(key=lambda evento: (evento[0], evento[1]))
+            pagina_texto = "\n\n".join(evento[3] for evento in eventos)
+            paginas.append(pagina_texto)
+
+    md = []
+    for indice, conteudo in enumerate(paginas):
+        if conteudo.strip():
+            md.append(conteudo)
+        if indice < len(paginas) - 1:
+            md.append(f"\n\n---\n*p. {indice + 1}*\n\n---\n\n")
+    return "".join(md), sum(1 for page in paginas for _ in re.finditer(r"!\[\[", page))
 
 
 # --- Checagem de sanidade: imagem na mesma página do PDF -------------------
@@ -1116,7 +1536,7 @@ def build_frontmatter(meta: dict) -> str:
     return "\n".join(lines)
 
 
-def convert_pdf(input_path: str, job_dir: str, meta: dict) -> dict:
+def convert_pdf(input_path: str, job_dir: str, meta: dict, crop_watermark: bool = False) -> dict:
     """Converte um PDF em Markdown para Obsidian dentro de job_dir.
 
     Estrutura gerada:
@@ -1130,54 +1550,61 @@ def convert_pdf(input_path: str, job_dir: str, meta: dict) -> dict:
     img_dir = os.path.join(job_dir, "images")
     os.makedirs(img_dir, exist_ok=True)
 
-    doc = pymupdf.open(input_path)
-    try:
-        ocr_por_pagina = _paginas_sem_texto_nativo(doc)
-        ancoras_por_pagina = _ancoras_de_imagem_por_pagina(doc)
-    finally:
-        doc.close()
+    with pymupdf.open(input_path) as doc:
+        caracteristicas = []
+        for page in doc:
+            blocks = page.get_text("dict").get("blocks", [])
+            imagens = [block for block in blocks if block.get("type") == 1]
+            area_imagens = sum(
+                max(0, block["bbox"][2] - block["bbox"][0])
+                * max(0, block["bbox"][3] - block["bbox"][1])
+                for block in imagens
+            )
+            chars_nativos = sum(
+                len(span.get("text", ""))
+                for block in blocks if block.get("type") == 0
+                for line in block.get("lines", [])
+                if line.get("bbox", (0, 0, 0, 0))[1] < page.rect.height * 0.93
+                for span in line.get("spans", [])
+            )
+            cobertura = area_imagens / (page.rect.width * page.rect.height)
+            caracteristicas.append(bool(imagens) and cobertura >= 0.20 and chars_nativos <= 250)
+        modo_visual = bool(caracteristicas) and all(caracteristicas)
 
-    md_text = pymupdf4llm.to_markdown(
-        input_path,
-        write_images=True,
-        image_path=img_dir,
-        image_format="png",
-        page_separators=True,
-    )
-    md_text = _aplicar_ocr_manual(md_text, ocr_por_pagina)
-    # Converte "<sup>N</sup>" (referência de nota de rodapé) para "[^N]"
-    # ANTES de normalize_markdown_text, que descarta a tag <sup> como ruído
-    # de HTML (ver docstring de `_converter_notas_rodape_sup`).
-    md_text = _converter_notas_rodape_sup(md_text)
-    md_text = normalize_markdown_text(md_text)
+    if modo_visual:
+        md_text, n_images = _extrair_layout_pdf(
+            input_path, img_dir, meta.get("display_name") or meta["slug"], crop_watermark
+        )
+        notas_rodape = []
+        assunto_lines = []
+    else:
+        doc = pymupdf.open(input_path)
+        try:
+            ocr_por_pagina = _paginas_sem_texto_nativo(doc)
+            ancoras_por_pagina = _ancoras_de_imagem_por_pagina(doc)
+            sites_no_rodape = _sites_no_rodape_pdf(doc)
+        finally:
+            doc.close()
 
-    # detect_assunto depende da granularidade linha-a-linha original (cada
-    # item do sumário numerado em sua própria linha) pra casar com
-    # `_OUTLINE_RE` -- por isso roda ANTES do reflow, que junta linhas de
-    # continuação e destruiria essa granularidade.
-    assunto_lines = detect_assunto(md_text)
+        md_text = pymupdf4llm.to_markdown(
+            input_path,
+            write_images=True,
+            image_path=img_dir,
+            image_format="png",
+            page_separators=True,
+        )
+        md_text = _aplicar_ocr_manual(md_text, ocr_por_pagina)
+        md_text = _remover_sites_por_posicao(md_text, sites_no_rodape)
+        md_text = _converter_notas_rodape_sup(md_text)
+        md_text = normalize_markdown_text(md_text)
+        assunto_lines = detect_assunto(md_text)
+        md_text, notas_rodape = process_pages_apostila(md_text, ancoras_por_pagina)
+        md_text = _processar_indice(md_text)
+        md_text = _destacar_citacoes_de_lei(md_text)
+        md_text = _destacar_jurisprudencia(md_text)
+        md_text = _aplicar_callouts_alerta(md_text)
 
-    # process_pages_apostila remove o rodapé de cada página, normaliza
-    # marcadores de tópico exóticos, extrai o corpo das notas de rodapé
-    # (renumerando pro documento inteiro), reposiciona cada imagem pro
-    # ponto do corpo onde ela aparece de verdade no PDF (ver
-    # `_ancoras_de_imagem_por_pagina` / `_reposicionar_imagens_pagina`) e
-    # faz o reflow de parágrafos com os padrões extras de índice/sumário
-    # da apostila (ver docstrings da seção "funções EXCLUSIVAS do
-    # pipeline de apostila" acima). É uma cópia isolada de `process_pages`
-    # -- `converter_legislacao.py` continua usando o `process_pages`
-    # original, sem essas adições (e não extrai imagem nenhuma).
-    md_text, notas_rodape = process_pages_apostila(md_text, ancoras_por_pagina)
-
-    # Índice/sumário do início do documento -> lista aninhada com
-    # wikilinks; citação de lei em bloco -> callout de citação; avisos
-    # didáticos (Obs., Atenção...) -> callout de atenção; e uma última
-    # rede de segurança contra resíduo de rodapé de site que tenha
-    # sobrevivido ao reflow.
-    md_text = _processar_indice(md_text)
-    md_text = _destacar_citacoes_de_lei(md_text)
-    md_text = _destacar_jurisprudencia(md_text)
-    md_text = _aplicar_callouts_alerta(md_text)
+    md_text = _normalizar_simbolos_logicos(md_text)
     md_text = _remover_sites_residuais(md_text)
 
     nome = meta.get("display_name") or meta["slug"]
@@ -1210,7 +1637,8 @@ def convert_pdf(input_path: str, job_dir: str, meta: dict) -> dict:
         # observado na nota de referência (![[Pasted image ...]]).
         return f"![[{new_basename}]]"
 
-    md_text = _IMG_LINK_RE.sub(_fix_link, md_text)
+    if not modo_visual:
+        md_text = _IMG_LINK_RE.sub(_fix_link, md_text)
 
     # Checagem de sanidade (só avisa em stderr, não falha o job): garante
     # que nenhum passo acima moveu uma imagem para fora da página do PDF
@@ -1221,7 +1649,8 @@ def convert_pdf(input_path: str, job_dir: str, meta: dict) -> dict:
     if os.path.isdir(img_dir) and not os.listdir(img_dir):
         os.rmdir(img_dir)
 
-    n_images = len(os.listdir(img_dir)) if os.path.isdir(img_dir) else 0
+    if not modo_visual:
+        n_images = len(os.listdir(img_dir)) if os.path.isdir(img_dir) else 0
 
     meta = dict(meta)
     meta["assunto_lines"] = assunto_lines
